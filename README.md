@@ -14,6 +14,23 @@ An interactive Bash script for installing and configuring an HTTPS proxy (Squid)
 - Root privileges
 
 ## Installation
+The script installs the necessary packages (`squid`, `dante-server`, `apache2-utils`, `fail2ban`) and guides you through configuration.
+
+### Installation Method 1 (fast)
+These command download and stream the installer directly into bash and execute it in one step.
+   ```bash
+   wget -qO- https://raw.githubusercontent.com/vitaz86/Proxy-Installer/refs/heads/main/proxy-installer.sh | sudo bash
+   ```
+
+### Installation Method 2 (fast)
+These command stream the installer directly into bash and execute it in one step.
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/vitaz86/Proxy-Installer/refs/heads/main/proxy-installer.sh | sudo bash
+   ```
+
+### Installation Method 3 (reviewing before run)
+For safety, consider reviewing the script before piping it into bash.
+These commands cloning the repo and running the script from disk.
 1. Clone the repository:
    ```bash
    git clone https://github.com/vitaz86/Proxy-Installer.git
@@ -30,7 +47,25 @@ An interactive Bash script for installing and configuring an HTTPS proxy (Squid)
    ```bash
    sudo ./proxy-installer.sh
    ```
-   The script installs the necessary packages (`squid`, `dante-server`, `apache2-utils`, `fail2ban`) and guides you through configuration.
+
+### Installation Method 4 (reviewing before run)
+1. Download the script:
+   ```bash
+   wget https://raw.githubusercontent.com/vitaz86/Proxy-Installer/refs/heads/main/proxy-installer.sh
+   ```
+2. Make the script executable if needed:
+   ```bash
+   chmod +x proxy-installer.sh
+   ```
+3. Run the installer:
+   ```bash
+   sudo ./proxy-installer.sh
+   ```
+
+To review the script run:
+   ```bash
+   nano proxy-installer.sh
+   ```
 
 ## Usage
 Follow the prompts to:
