@@ -15,43 +15,21 @@ An interactive Bash script for installing and configuring an HTTPS proxy (Squid)
 
 ## Installation
 The script installs the necessary packages (`squid`, `dante-server`, `apache2-utils`, `fail2ban`) and guides you through configuration.
-
-### Installation Method 1 (fast)
-These command download and stream the installer directly into bash and execute it in one step.
-   ```bash
-   wget -qO- https://raw.githubusercontent.com/vitaz86/Proxy-Installer/refs/heads/main/proxy-installer.sh | sudo bash
-   ```
-
-### Installation Method 2 (fast)
-These command stream the installer directly into bash and execute it in one step.
-   ```bash
-   curl -fsSL https://raw.githubusercontent.com/vitaz86/Proxy-Installer/refs/heads/main/proxy-installer.sh | sudo bash
-   ```
-
-### Installation Method 3 (reviewing before run)
 For safety, consider reviewing the script before piping it into bash.
-These commands cloning the repo and running the script from disk.
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/vitaz86/Proxy-Installer.git
-   ```
-2. Enter the directory:
-   ```bash
-   cd Proxy-Installer
-   ```
-3. Make the script executable if needed:
-   ```bash
-   chmod +x proxy-installer.sh
-   ```
-4. Run the installer:
-   ```bash
-   sudo ./proxy-installer.sh
-   ```
+These commands downloading (or cloning the repo) and running the script from disk.
 
-### Installation Method 4 (reviewing before run)
-1. Download the script:
+1. Download script or clone the repository:
+   ```bash
+   curl -O https://raw.githubusercontent.com/vitaz86/Proxy-Installer/refs/heads/main/proxy-installer.sh
+   ```
+   or
    ```bash
    wget https://raw.githubusercontent.com/vitaz86/Proxy-Installer/refs/heads/main/proxy-installer.sh
+   ```
+   or
+   ```bash
+   git clone https://github.com/vitaz86/Proxy-Installer.git
+   cd Proxy-Installer
    ```
 2. Make the script executable if needed:
    ```bash
@@ -62,10 +40,15 @@ These commands cloning the repo and running the script from disk.
    sudo ./proxy-installer.sh
    ```
 
-To review the script run:
+If you want to review the script before run:
    ```bash
    nano proxy-installer.sh
    ```
+
+DON'T USE one line bash commands that downloading and streaming the installer directly into bash and execute it in one step, because thay can't run interactive .SH script menus!!!
+Examples:
+curl -fsSL https://raw.githubusercontent.com/vitaz86/Proxy-Installer/refs/heads/main/proxy-installer.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/vitaz86/Proxy-Installer/refs/heads/main/proxy-installer.sh | sudo bash
 
 ## Usage
 Follow the prompts to:
