@@ -46,9 +46,11 @@ If you want to review the script before run:
    ```
 
 DON'T USE one line bash commands that downloading and streaming the installer directly into bash and execute it in one step, because thay can't run interactive .SH script menus!!!
-Examples:
-curl -fsSL https://raw.githubusercontent.com/vitaz86/Proxy-Installer/refs/heads/main/proxy-installer.sh | sudo bash
-wget -qO- https://raw.githubusercontent.com/vitaz86/Proxy-Installer/refs/heads/main/proxy-installer.sh | sudo bash
+Examples (BAD for this .SH script):
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/vitaz86/Proxy-Installer/refs/heads/main/proxy-installer.sh | sudo bash
+   wget -qO- https://raw.githubusercontent.com/vitaz86/Proxy-Installer/refs/heads/main/proxy-installer.sh | sudo bash
+   ```
 
 ## Usage
 Follow the prompts to:
