@@ -3,7 +3,7 @@
 # ====================================================================
 #   Advanced Proxy Installer v4 by vitaz86
 #   Продуманный интерактивный скрипт для безопасной установки и
-#   переустановки Squid, Dante и Fail2ban на Ubuntu 22.04.
+#   переустановки Squid, Dante и Fail2ban на Ubuntu 22.04 и 24.04.
 # ====================================================================
 
 # --- Цвета для красивого вывода ---
@@ -16,11 +16,11 @@ C_YELLOW='\033[1;33m'
 # --- Функции ---
 function isRoot() { if [ "$EUID" -ne 0 ]; then return 1; fi; }
 function checkOS() {
-	source /etc/os-release
-	if [[ "$ID" != "ubuntu" || "$VERSION_ID" != "22.04" ]]; then
-		echo -e "${C_RED}Ошибка: Этот скрипт предназначен только для Ubuntu 22.04.${C_RESET}"
-		exit 1
-	fi
+        source /etc/os-release
+        if [[ "$ID" != "ubuntu" || ( "$VERSION_ID" != "22.04" && "$VERSION_ID" != "24.04" ) ]]; then
+                echo -e "${C_RED}Ошибка: Этот скрипт предназначен только для Ubuntu 22.04/24.04.${C_RESET}"
+                exit 1
+        fi
 }
 
 function cleanup() {
@@ -120,8 +120,8 @@ sleep 2
 
 # --- Фаза 2: Установка и настройка ---
 echo -e "\n${C_YELLOW}--- Шаг 2: Установка пакетов ---${C_RESET}"
-apt-get update > /dev/null
-apt-get install -y squid dante-server apache2-utils fail2ban
+apt-get update > /dev/null || { echo -e "${C_RED}Не удалось обновить списки пакетов.${C_RESET}"; exit 1; }
+apt-get install -y squid dante-server apache2-utils fail2ban || { echo -e "${C_RED}Не удалось установить необходимые пакеты.${C_RESET}"; exit 1; }
 echo "Пакеты успешно установлены."
 
 if [ ${#USERS[@]} -gt 0 ]; then
@@ -181,9 +181,18 @@ EOF
 echo "Файлы конфигурации созданы."
 
 echo -e "\n${C_YELLOW}--- Шаг 5: Перезапуск служб ---${C_RESET}"
-systemctl restart squid; systemctl enable squid;
-systemctl restart danted; systemctl enable danted;
-systemctl restart fail2ban; systemctl enable fail2ban;
+if ! systemctl restart squid || ! systemctl enable squid; then
+    echo -e "${C_RED}Не удалось перезапустить или включить службу squid.${C_RESET}"
+    exit 1
+fi
+if ! systemctl restart danted || ! systemctl enable danted; then
+    echo -e "${C_RED}Не удалось перезапустить или включить службу danted.${C_RESET}"
+    exit 1
+fi
+if ! systemctl restart fail2ban || ! systemctl enable fail2ban; then
+    echo -e "${C_RED}Не удалось перезапустить или включить службу fail2ban.${C_RESET}"
+    exit 1
+fi
 echo "Службы успешно перезапущены и добавлены в автозагрузку."
 
 # --- Итоги ---
