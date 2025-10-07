@@ -5,6 +5,8 @@ An interactive Bash script for installing and configuring an HTTPS proxy (Squid)
 ## Features
 - Supports Ubuntu 22.04 LTS and 24.04 LTS
 - Installs Squid (HTTPS) and Dante (SOCKS5)
+- Installs Unbound DNS resolver
+- Setup BBR
 - Automatically configures Fail2ban rules for both proxies
 - Interactive wizard for authentication mode, user creation, IP whitelisting and custom ports
 - Optional cleanup of previous installations

@@ -31,7 +31,7 @@ function cleanup() {
     echo "Службы остановлены."
 
     # Полное удаление пакетов вместе с конфигурациями
-    apt-get purge -y squid dante-server apache2-utils fail2ban &>/dev/null
+    apt-get purge -y squid dante-server apache2-utils fail2ban unbound &>/dev/null
     apt-get autoremove -y &>/dev/null
     echo "Пакеты и конфигурации удалены."
 
@@ -115,6 +115,11 @@ echo -e "\nУкажите порты для прокси."
 read -rp "Порт для Squid (HTTPS) [1-65535]: " -e -i 3128 SQUID_PORT
 read -rp "Порт для Dante (SOCKS5) [1-65535]: " -e -i 1080 DANTE_PORT
 
+echo -e "\nУстановить Unbound DNS resolver для ускорения DNS-запросов?"
+read -p "(y/n): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then INSTALL_UNBOUND=true; fi
+
 echo -e "\n${C_GREEN}Отлично! Начинаем установку...${C_RESET}"
 sleep 2
 
@@ -122,7 +127,15 @@ sleep 2
 echo -e "\n${C_YELLOW}--- Шаг 2: Установка пакетов ---${C_RESET}"
 apt-get update > /dev/null || { echo -e "${C_RED}Не удалось обновить списки пакетов.${C_RESET}"; exit 1; }
 apt-get install -y squid dante-server apache2-utils fail2ban || { echo -e "${C_RED}Не удалось установить необходимые пакеты.${C_RESET}"; exit 1; }
+if [ "$INSTALL_UNBOUND" = true ]; then
+    apt-get install -y unbound || { echo -e "${C_RED}Не удалось установить unbound.${C_RESET}"; exit 1; }
+fi
 echo "Пакеты успешно установлены."
+echo -e "\n${C_YELLOW}--- Шаг 2.5: Включение BBR (TCP Congestion Control) ---${C_RESET}"
+echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+sysctl -p > /dev/null
+echo "BBR успешно включен для улучшения производительности сети."
 
 if [ ${#USERS[@]} -gt 0 ]; then
     echo -e "\n${C_YELLOW}--- Шаг 3: Создание пользователей и паролей ---${C_RESET}"
@@ -193,6 +206,13 @@ if ! systemctl restart fail2ban || ! systemctl enable fail2ban; then
     echo -e "${C_RED}Не удалось перезапустить или включить службу fail2ban.${C_RESET}"
     exit 1
 fi
+if [ "$INSTALL_UNBOUND" = true ]; then
+    if ! systemctl restart unbound || ! systemctl enable unbound; then
+        echo -e "${C_RED}Не удалось перезапустить или включить службу unbound.${C_RESET}"
+        exit 1
+    fi
+    echo "Unbound DNS resolver успешно установлен и запущен."
+fi
 echo "Службы успешно перезапущены и добавлены в автозагрузку."
 
 # --- Итоги ---
@@ -210,5 +230,6 @@ echo -e "  ${C_YELLOW}SOCKS5 Прокси (Dante):${C_RESET}"; echo "    Пор�
 echo -e "  ${C_YELLOW}Метод доступа:${C_RESET} $AUTH_MODE_TEXT"
 if [ ${#USERS[@]} -gt 0 ]; then echo -e "  ${C_YELLOW}Пользователи:${C_RESET} ${USERS[*]}"; fi
 if [[ -n "$WHITELIST_IPS" ]]; then echo -e "  ${C_YELLOW}Белый список IP:${C_RESET} $WHITELIST_IPS"; fi
+if [ "$INSTALL_UNBOUND" = true ]; then echo -e "  ${C_YELLOW}Unbound DNS:${C_RESET} Установлен и запущен (127.0.0.1:53)"; fi
 echo
 echo -e "${C_GREEN}=======================================================${C_RESET}"
