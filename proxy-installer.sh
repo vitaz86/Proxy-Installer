@@ -1,9 +1,8 @@
 #!/bin/bash
 
 # ====================================================================
-#   Advanced Proxy Installer v6 by vitaz86
-#   Продуманный интерактивный скрипт для безопасной установки и
-#   переустановки Squid, Dante и Fail2ban на Ubuntu 22.04 и 24.04.
+#   Advanced Proxy Installer v7 by vitaz86
+#   Продуманный интерактивный скрипт для безопасной установки Прокси на Ubuntu 22.04 и 24.04.
 # ====================================================================
 
 # --- Цвета для красивого вывода ---
@@ -52,10 +51,186 @@ function cleanup() {
     sleep 2
 }
 
+function validate_port() {
+    local port=$1
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo -e "${C_RED}Ошибка: Порт должен быть числом от 1 до 65535.${C_RESET}"
+        return 1
+    fi
+    return 0
+}
+
+function validate_username() {
+    local username=$1
+    if ! [[ "$username" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo -e "${C_RED}Ошибка: Имя пользователя может содержать только буквы, цифры, дефисы и подчеркивания.${C_RESET}"
+        return 1
+    fi
+    return 0
+}
+
+function validate_ip() {
+    local ip=$1
+    if ! [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]{1,5})?$ ]] && ! [[ "$ip" =~ ^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$ ]]; then
+        echo -e "${C_RED}Ошибка: Неверный формат IP-адреса.${C_RESET}"
+        return 1
+    fi
+    return 0
+}
+
+function validate_ips() {
+    local ips=$1
+    for ip in $ips; do
+        if ! validate_ip "$ip"; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+function install_packages() {
+    echo -e "\n${C_YELLOW}--- Шаг 2: Установка пакетов ---${C_RESET}"
+    apt-get update -qq -o Acquire::Retries=3 || { echo -e "${C_RED}Не удалось обновить списки пакетов.${C_RESET}"; exit 1; }
+    apt-get install -y -qq squid dante-server apache2-utils fail2ban || { echo -e "${C_RED}Не удалось установить необходимые пакеты.${C_RESET}"; exit 1; }
+    if [ "$INSTALL_UNBOUND" = true ]; then
+        apt-get install -y -qq unbound || { echo -e "${C_RED}Не удалось установить unbound.${C_RESET}"; exit 1; }
+    fi
+    echo "Пакеты успешно установлены."
+
+    echo -e "\n${C_YELLOW}--- Шаг 2.5: Включение BBR и оптимизация сети ---${C_RESET}"
+    echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+    echo "net.core.somaxconn = 65536" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_max_syn_backlog = 65536" >> /etc/sysctl.conf
+    echo "net.ipv4.ip_local_port_range = 1024 65535" >> /etc/sysctl.conf
+    echo "net.core.netdev_max_backlog = 5000" >> /etc/sysctl.conf
+    sysctl -p > /dev/null
+    echo "Оптимизация сети успешно применена."
+}
+
+function configure_services() {
+    echo -e "\n${C_YELLOW}--- Шаг 4: Настройка конфигураций ---${C_RESET}"
+    SQUID_CONF="/etc/squid/squid.conf"
+    DANTE_CONF="/etc/danted.conf"
+    JAIL_LOCAL="/etc/fail2ban/jail.local"
+    DANTE_FILTER="/etc/fail2ban/filter.d/dante.conf"
+
+    # Резервное копирование существующих конфигов
+    if [ -f "$SQUID_CONF" ]; then cp "$SQUID_CONF" "$SQUID_CONF.bak"; fi
+    if [ -f "$DANTE_CONF" ]; then cp "$DANTE_CONF" "$DANTE_CONF.bak"; fi
+    if [ -f "$JAIL_LOCAL" ]; then cp "$JAIL_LOCAL" "$JAIL_LOCAL.bak"; fi
+    if [ -f "$DANTE_FILTER" ]; then cp "$DANTE_FILTER" "$DANTE_FILTER.bak"; fi
+
+    {
+        if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "2" ]]; then
+            echo "auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd"; echo "auth_param basic realm \"Squid Proxy\""; echo "acl authenticated proxy_auth REQUIRED";
+        fi
+        if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "3" ]]; then echo "acl whitelist src $WHITELIST_IPS"; fi
+        echo -e "\nhttp_access allow localhost"
+        if [[ "$AUTH_CHOICE" == "1" ]]; then echo "http_access allow whitelist"; echo "http_access allow authenticated";
+        elif [[ "$AUTH_CHOICE" == "2" ]]; then echo "http_access allow authenticated";
+        elif [[ "$AUTH_CHOICE" == "3" ]]; then echo "http_access allow whitelist"; fi
+        echo "http_access deny all"; echo -e "\nhttp_port $SQUID_PORT"; echo "via off"; echo "forwarded_for off";
+        if [ "$INSTALL_UNBOUND" = true ]; then echo "dns_nameservers 127.0.0.1"; fi
+    } > $SQUID_CONF
+
+    EXTERNAL_INTERFACE=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
+    if [ -z "$EXTERNAL_INTERFACE" ]; then
+        echo -e "${C_RED}Ошибка: Не удалось определить внешний сетевой интерфейс. Проверьте подключение к интернету.${C_RESET}"
+        exit 1
+    fi
+    {
+        echo "logoutput: /var/log/danted.log"; echo "internal: 0.0.0.0 port = $DANTE_PORT";
+        echo "external: $EXTERNAL_INTERFACE"; echo "user.privileged: root"; echo "user.notprivileged: nobody";
+        if [ "$INSTALL_UNBOUND" = true ]; then echo -e "\nresolve { nameserver 127.0.0.1 }"; fi
+        echo -e "\n# Rules"
+        if [[ "$AUTH_CHOICE" == "1" ]]; then
+            for ip in $WHITELIST_IPS; do echo "client pass { from: $ip/32 to: 0.0.0.0/0 method: none }"; done
+            echo "client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 method: username log: error }";
+        elif [[ "$AUTH_CHOICE" == "2" ]]; then echo "client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 method: username log: error }";
+        elif [[ "$AUTH_CHOICE" == "3" ]]; then
+            for ip in $WHITELIST_IPS; do echo "client pass { from: $ip/32 to: 0.0.0.0/0 method: none }"; done
+        fi
+        echo "client block { from: 0.0.0.0/0 to: 0.0.0.0/0 log: connect error }";
+        echo -e "\npass { from: 0.0.0.0/0 to: 0.0.0.0/0 command: bind connect udpassociate log: error }";
+    } > $DANTE_CONF
+
+    {
+        echo "[DEFAULT]"; echo "bantime = 1h"; echo;
+        echo "[sshd]"; echo "enabled = true"; echo "maxretry = 3"; echo;
+        echo "[squid]"; echo "enabled = true"; echo "port = $SQUID_PORT"; echo "logpath = /var/log/squid/access.log"; echo "bantime = 2h"; echo;
+        echo "[dante]"; echo "enabled = true"; echo "port = $DANTE_PORT"; echo "logpath = /var/log/danted.log"; echo "bantime = 2h";
+    } > /etc/fail2ban/jail.local
+    cat <<EOF > /etc/fail2ban/filter.d/dante.conf
+[Definition]
+failregex = pam_authenticate\(\): error in service \((\S+)\) getting password from user \((\S+)\) through <HOST>
+EOF
+    echo "Файлы конфигурации созданы."
+}
+
+function setup_firewall() {
+    echo -e "\n${C_YELLOW}--- Настройка firewall ---${C_RESET}"
+
+    # Проверка установки
+    if ! dpkg -s ufw &>/dev/null; then
+        apt-get install -y ufw &>/dev/null || { echo -e "${C_RED}Не удалось установить ufw.${C_RESET}"; exit 1; }
+    fi
+
+    # Проверка конфликтов с другими firewall
+    if systemctl is-active firewalld --quiet 2>/dev/null; then
+        echo -e "${C_YELLOW}Предупреждение: Обнаружен firewalld. UFW может конфликтовать. Рекомендуется отключить firewalld.${C_RESET}"
+        read -p "Продолжить? (y/n): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 0; fi
+    fi
+
+    # Резервное копирование правил
+    ufw status numbered > /etc/ufw/ufw.rules.backup 2>/dev/null || true
+
+    # Добавление правил
+    ufw allow $SQUID_PORT/tcp &>/dev/null
+    ufw allow $DANTE_PORT/tcp &>/dev/null
+
+    # Включение, если не активно
+    if ! ufw status | grep -q "Status: active"; then
+        ufw --force enable &>/dev/null
+    else
+        ufw reload &>/dev/null  # Перезагрузка правил
+    fi
+
+    echo "Firewall настроен."
+}
+
+function restart_services() {
+    echo -e "\n${C_YELLOW}--- Шаг 5: Перезапуск служб ---${C_RESET}"
+    if ! systemctl restart squid || ! systemctl enable squid || ! systemctl is-active squid --quiet; then
+        echo -e "${C_RED}Не удалось перезапустить или включить службу squid.${C_RESET}"
+        exit 1
+    fi
+    if ! systemctl restart danted || ! systemctl enable danted || ! systemctl is-active danted --quiet; then
+        echo -e "${C_RED}Не удалось перезапустить или включить службу danted.${C_RESET}"
+        exit 1
+    fi
+    if ! systemctl restart fail2ban || ! systemctl enable fail2ban || ! systemctl is-active fail2ban --quiet; then
+        echo -e "${C_RED}Не удалось перезапустить или включить службу fail2ban.${C_RESET}"
+        exit 1
+    fi
+    if [ "$INSTALL_UNBOUND" = true ]; then
+        if ! systemctl restart unbound || ! systemctl enable unbound || ! systemctl is-active unbound --quiet; then
+            echo -e "${C_RED}Не удалось перезапустить или включить службу unbound.${C_RESET}"
+            exit 1
+        fi
+        echo "Unbound DNS resolver успешно установлен и запущен."
+    fi
+    echo "Службы успешно перезапущены и добавлены в автозагрузку."
+
+    setup_firewall
+}
+
 # --- Начало ---
 clear
 echo -e "${C_BLUE}=======================================================${C_RESET}"
-echo -e "${C_BLUE}==   Advanced Proxy Installer v4 - vitaz86 ==${C_RESET}"
+echo -e "${C_BLUE}==   Advanced Proxy Installer - vitaz86 ==${C_RESET}"
 echo -e "${C_BLUE}=======================================================${C_RESET}"
 echo
 echo "Этот скрипт установит Squid, Dante и Fail2ban."
@@ -63,6 +238,19 @@ echo "Этот скрипт установит Squid, Dante и Fail2ban."
 # --- Проверки системы ---
 if ! isRoot; then echo -e "${C_RED}Ошибка: Запустите скрипт с правами root (sudo).${C_RESET}"; exit 1; fi
 checkOS
+
+# Проверка подключения к интернету
+if ! ping -c 1 -W 5 8.8.8.8 &>/dev/null; then
+    echo -e "${C_RED}Ошибка: Нет подключения к интернету.${C_RESET}"
+    exit 1
+fi
+
+# Проверка свободного места на диске (минимум 500MB)
+DISK_FREE=$(df / | tail -1 | awk '{print $4}')
+if [ "$DISK_FREE" -lt 500000 ]; then
+    echo -e "${C_RED}Ошибка: Недостаточно свободного места на диске (минимум 500MB).${C_RESET}"
+    exit 1
+fi
 
 # --- Проверка и предложение очистки ---
 if dpkg -s squid &>/dev/null || dpkg -s dante-server &>/dev/null; then
@@ -94,8 +282,16 @@ done
 
 WHITELIST_IPS=""
 if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "3" ]]; then
-    echo -e "\nВведите IP-адреса для белого списка (через пробел):"
-    read -rp "Пример: 8.8.8.8 1.1.1.1: " -e WHITELIST_IPS
+    while true; do
+        echo -e "\nВведите IP-адреса для белого списка (через пробел):"
+        read -rp "Пример: 8.8.8.8 1.1.1.1: " -e WHITELIST_IPS
+        if [[ "$AUTH_CHOICE" == "3" && -z "$WHITELIST_IPS" ]]; then
+            echo -e "${C_RED}Для режима 'Только Белый список IP' требуется хотя бы один IP-адрес.${C_RESET}"
+            continue
+        fi
+        if [ -n "$WHITELIST_IPS" ] && ! validate_ips "$WHITELIST_IPS"; then continue; fi
+        break
+    done
 fi
 
 USERS=()
@@ -107,13 +303,20 @@ if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "2" ]]; then
             if [ ${#USERS[@]} -eq 0 ]; then echo -e "${C_RED}Добавьте хотя бы одного пользователя.${C_RESET}"; continue; fi
             break
         fi
+        if ! validate_username "$username"; then continue; fi
         USERS+=("$username")
     done
 fi
 
 echo -e "\nУкажите порты для прокси."
-read -rp "Порт для Squid (HTTPS) [1-65535]: " -e -i 3128 SQUID_PORT
-read -rp "Порт для Dante (SOCKS5) [1-65535]: " -e -i 1080 DANTE_PORT
+while true; do
+    read -rp "Порт для Squid (HTTPS) [1-65535]: " -e -i 3128 SQUID_PORT
+    if validate_port "$SQUID_PORT"; then break; fi
+done
+while true; do
+    read -rp "Порт для Dante (SOCKS5) [1-65535]: " -e -i 1080 DANTE_PORT
+    if validate_port "$DANTE_PORT"; then break; fi
+done
 
 echo -e "\nУстановить Unbound DNS resolver для ускорения DNS-запросов?"
 read -p "(y/n): " -n 1 -r
@@ -124,98 +327,45 @@ echo -e "\n${C_GREEN}Отлично! Начинаем установку...${C_R
 sleep 2
 
 # --- Фаза 2: Установка и настройка ---
-echo -e "\n${C_YELLOW}--- Шаг 2: Установка пакетов ---${C_RESET}"
-apt-get update > /dev/null || { echo -e "${C_RED}Не удалось обновить списки пакетов.${C_RESET}"; exit 1; }
-apt-get install -y squid dante-server apache2-utils fail2ban || { echo -e "${C_RED}Не удалось установить необходимые пакеты.${C_RESET}"; exit 1; }
-if [ "$INSTALL_UNBOUND" = true ]; then
-    apt-get install -y unbound || { echo -e "${C_RED}Не удалось установить unbound.${C_RESET}"; exit 1; }
-fi
-echo "Пакеты успешно установлены."
-echo -e "\n${C_YELLOW}--- Шаг 2.5: Включение BBR (TCP Congestion Control) ---${C_RESET}"
-echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-sysctl -p > /dev/null
-echo "BBR успешно включен для улучшения производительности сети."
+install_packages
 
 if [ ${#USERS[@]} -gt 0 ]; then
     echo -e "\n${C_YELLOW}--- Шаг 3: Создание пользователей и паролей ---${C_RESET}"
     FIRST_USER=true
     for user in "${USERS[@]}"; do
         echo "-> Настройка пользователя '$user'..."
-        useradd -r -s /bin/false "$user"
+        if id "$user" &>/dev/null; then
+            echo -e "${C_RED}Ошибка: Пользователь '$user' уже существует.${C_RESET}"
+            exit 1
+        fi
+        if ! useradd -r -s /bin/false "$user"; then
+            echo -e "${C_RED}Ошибка: Не удалось создать пользователя '$user'.${C_RESET}"
+            exit 1
+        fi
         echo "   - Задайте пароль для Dante (SOCKS5):"
-        passwd "$user"
+        if ! passwd "$user"; then
+            echo -e "${C_RED}Ошибка: Не удалось установить пароль для '$user'.${C_RESET}"
+            exit 1
+        fi
         echo "   - Повторно введите пароль для Squid (HTTPS):"
-        if [ "$FIRST_USER" = true ]; then htpasswd -c /etc/squid/passwd "$user"; FIRST_USER=false; else htpasswd /etc/squid/passwd "$user"; fi
+        if [ "$FIRST_USER" = true ]; then
+            if ! htpasswd -c /etc/squid/passwd "$user"; then
+                echo -e "${C_RED}Ошибка: Не удалось создать файл паролей Squid.${C_RESET}"
+                exit 1
+            fi
+            FIRST_USER=false
+        else
+            if ! htpasswd /etc/squid/passwd "$user"; then
+                echo -e "${C_RED}Ошибка: Не удалось добавить пользователя в файл паролей Squid.${C_RESET}"
+                exit 1
+            fi
+        fi
     done
 fi
 
-echo -e "\n${C_YELLOW}--- Шаг 4: Настройка конфигураций ---${C_RESET}"
-SQUID_CONF="/etc/squid/squid.conf"
-{
-    if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "2" ]]; then
-        echo "auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd"; echo "auth_param basic realm \"Squid Proxy\""; echo "acl authenticated proxy_auth REQUIRED";
-    fi
-    if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "3" ]]; then echo "acl whitelist src $WHITELIST_IPS"; fi
-    echo -e "\nhttp_access allow localhost"
-    if [[ "$AUTH_CHOICE" == "1" ]]; then echo "http_access allow whitelist"; echo "http_access allow authenticated";
-    elif [[ "$AUTH_CHOICE" == "2" ]]; then echo "http_access allow authenticated";
-    elif [[ "$AUTH_CHOICE" == "3" ]]; then echo "http_access allow whitelist"; fi
-    echo "http_access deny all"; echo -e "\nhttp_port $SQUID_PORT"; echo "via off"; echo "forwarded_for off";
-    if [ "$INSTALL_UNBOUND" = true ]; then echo "dns_nameservers 127.0.0.1"; fi
-} > $SQUID_CONF
+configure_services
 
-DANTE_CONF="/etc/danted.conf"
-EXTERNAL_INTERFACE=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
-{
-    echo "logoutput: /var/log/danted.log"; echo "internal: 0.0.0.0 port = $DANTE_PORT";
-    echo "external: $EXTERNAL_INTERFACE"; echo "user.privileged: root"; echo "user.notprivileged: nobody";
-    if [ "$INSTALL_UNBOUND" = true ]; then echo -e "\nresolve { nameserver 127.0.0.1 }"; fi
-    echo -e "\n# Rules"
-    if [[ "$AUTH_CHOICE" == "1" ]]; then
-        for ip in $WHITELIST_IPS; do echo "client pass { from: $ip/32 to: 0.0.0.0/0 method: none }"; done
-        echo "client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 method: username log: error }";
-    elif [[ "$AUTH_CHOICE" == "2" ]]; then echo "client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 method: username log: error }";
-    elif [[ "$AUTH_CHOICE" == "3" ]]; then
-        for ip in $WHITELIST_IPS; do echo "client pass { from: $ip/32 to: 0.0.0.0/0 method: none }"; done
-    fi
-    echo "client block { from: 0.0.0.0/0 to: 0.0.0.0/0 log: connect error }";
-    echo -e "\npass { from: 0.0.0.0/0 to: 0.0.0.0/0 command: bind connect udpassociate log: error }";
-} > $DANTE_CONF
-
-{
-    echo "[DEFAULT]"; echo "bantime = 1h"; echo;
-    echo "[sshd]"; echo "enabled = true"; echo "maxretry = 3"; echo;
-    echo "[squid]"; echo "enabled = true"; echo "port = $SQUID_PORT"; echo "logpath = /var/log/squid/access.log"; echo "bantime = 2h"; echo;
-    echo "[dante]"; echo "enabled = true"; echo "port = $DANTE_PORT"; echo "logpath = /var/log/danted.log"; echo "bantime = 2h";
-} > /etc/fail2ban/jail.local
-cat <<EOF > /etc/fail2ban/filter.d/dante.conf
-[Definition]
-failregex = pam_authenticate\(\): error in service \((\S+)\) getting password from user \((\S+)\) through <HOST>
-EOF
-echo "Файлы конфигурации созданы."
-
-echo -e "\n${C_YELLOW}--- Шаг 5: Перезапуск служб ---${C_RESET}"
-if ! systemctl restart squid || ! systemctl enable squid; then
-    echo -e "${C_RED}Не удалось перезапустить или включить службу squid.${C_RESET}"
-    exit 1
-fi
-if ! systemctl restart danted || ! systemctl enable danted; then
-    echo -e "${C_RED}Не удалось перезапустить или включить службу danted.${C_RESET}"
-    exit 1
-fi
-if ! systemctl restart fail2ban || ! systemctl enable fail2ban; then
-    echo -e "${C_RED}Не удалось перезапустить или включить службу fail2ban.${C_RESET}"
-    exit 1
-fi
-if [ "$INSTALL_UNBOUND" = true ]; then
-    if ! systemctl restart unbound || ! systemctl enable unbound; then
-        echo -e "${C_RED}Не удалось перезапустить или включить службу unbound.${C_RESET}"
-        exit 1
-    fi
-    echo "Unbound DNS resolver успешно установлен и запущен."
-fi
-echo "Службы успешно перезапущены и добавлены в автозагрузку."
+restart_services
 
 # --- Итоги ---
 SERVER_IP=$(hostname -I | awk '{print $1}')
