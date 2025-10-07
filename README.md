@@ -6,7 +6,8 @@ An interactive Bash script for installing and configuring an HTTPS proxy (Squid)
 - Supports Ubuntu 22.04 LTS and 24.04 LTS
 - Installs Squid (HTTPS) and Dante (SOCKS5) with Fail2ban protection
 - Optional installation of Unbound DNS resolver for faster DNS queries
-- Enables BBR TCP congestion control and network optimizations for better performance
+- **Advanced Performance Optimizations**: Comprehensive system tuning including BBR TCP congestion control, network stack optimizations, buffer configurations, and proxy-specific settings for maximum throughput and reduced latency
+- **Automatic Resource Detection**: Detects system resources (CPU cores, RAM, disk) and automatically selects optimized configurations for low-end VPS (1-2 cores, 1-2 GB RAM) or high-performance servers
 - Automatically configures Fail2ban rules for increased security and protection against burglary
 - Interactive wizard with input validation for authentication mode, user creation, IP whitelisting, and custom ports
 - Comprehensive error handling and system checks (internet connectivity, disk space, existing users)
@@ -64,6 +65,28 @@ The script performs system checks (internet, disk space) and validates all input
 
 For Unbound, you can flush DNS cache with: `sudo unbound-control flush_zone .`
 
+## Performance Optimizations
+The script includes comprehensive optimizations for maximum proxy performance:
+
+### System-Level Tuning
+- **Network Stack**: BBR congestion control, optimized TCP/UDP buffers, connection limits, and interface settings
+- **Kernel Parameters**: Memory management, process limits, and I/O optimizations
+- **Ulimits**: Increased file descriptors, processes, and memory limits
+
+### Proxy-Specific Configurations
+- **Squid**: Optimized caching, connection pooling, memory usage, and concurrency settings
+- **Dante**: Tuned thread counts, buffer sizes, and connection timeouts
+
+### Resource-Aware Optimization
+- **Automatic Detection**: Script detects CPU cores, RAM, and disk space
+- **Low-Resource Mode**: For VPS with ≤2 CPU cores or ≤2 GB RAM, uses conservative settings to prevent overload
+- **High-Performance Mode**: For servers with >2 cores and >2 GB RAM, applies aggressive optimizations
+
+### Included Configuration Files
+- `squid.conf` / `squid-low.conf`: Squid configurations
+- `danted.conf` / `danted-low.conf`: Dante configurations
+- `system-tune.sh` / `system-tune-low.sh`: System optimization scripts
+
 ## Troubleshooting
 - If the script fails with network errors, ensure internet connectivity.
 - Check logs: `/var/log/squid/access.log`, `/var/log/danted.log`, `/var/log/fail2ban.log`
@@ -79,6 +102,10 @@ For Unbound, you can flush DNS cache with: `sudo unbound-control flush_zone .`
   - `/etc/danted.conf` (and `/etc/danted.conf.bak`)
   - `/etc/fail2ban/jail.local` (and `/etc/fail2ban/jail.local.bak`)
   - `/etc/fail2ban/filter.d/dante.conf` (and `/etc/fail2ban/filter.d/dante.conf.bak`)
+- The script uses optimized template files that can be customized:
+  - `squid.conf` / `squid-low.conf`: Base Squid configurations
+  - `danted.conf` / `danted-low.conf`: Base Dante configurations
+  - `system-tune.sh` / `system-tune-low.sh`: System optimization scripts
 - Restart the services after manual changes:
   ```bash
   sudo systemctl restart squid danted fail2ban unbound
