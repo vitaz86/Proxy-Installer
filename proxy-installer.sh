@@ -169,12 +169,14 @@ function configure_services() {
             fi
             # Add authentication and access rules
             if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "2" ]]; then
-                sed -i 's/# auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd/auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd/' $SQUID_CONF
+                sed -i 's|# auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd|auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd|' $SQUID_CONF
                 sed -i 's/# auth_param basic realm "Squid Proxy"/auth_param basic realm "Squid Proxy"/' $SQUID_CONF
                 sed -i 's/# acl authenticated proxy_auth REQUIRED/acl authenticated proxy_auth REQUIRED/' $SQUID_CONF
+                echo "Squid authentication configuration applied."
             fi
             if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "3" ]]; then
                 sed -i "s/# acl whitelist src 192.168.1.0\/24/acl whitelist src $WHITELIST_IPS/" $SQUID_CONF
+                echo "Squid whitelist configuration applied."
             fi
             # Update access rules
             sed -i 's/# http_access allow whitelist/http_access allow whitelist/' $SQUID_CONF
@@ -187,6 +189,7 @@ function configure_services() {
             elif [[ "$AUTH_CHOICE" == "3" ]]; then
                 sed -i 's/http_access allow whitelist/http_access allow whitelist/' $SQUID_CONF
             fi
+            echo "Squid access rules updated."
         else
             # Fallback
             {
@@ -255,6 +258,7 @@ function configure_services() {
                     sed -i "/client pass { from: 0.0.0.0\/0 to: 0.0.0.0\/0 method: none }/i client pass { from: $ip/32 to: 0.0.0.0/0 method: none }" $DANTE_CONF
                 done
             fi
+            echo "Dante authentication and rules configured."
         else
             # Fallback
             {
@@ -302,6 +306,7 @@ function configure_services() {
 [Definition]
 failregex = pam_authenticate\(\): error in service \((\S+)\) getting password from user \((\S+)\) through <HOST>
 EOF
+    echo "All service configurations completed successfully."
     echo "Файлы конфигурации созданы."
 }
 
