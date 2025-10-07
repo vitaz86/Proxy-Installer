@@ -1,6 +1,6 @@
 # Proxy-Installer
 
-An interactive Bash script for installing and configuring an HTTPS proxy (Squid) and a SOCKS5 proxy (Dante) with Fail2ban protection on Ubuntu 22.04 and 24.04.
+An interactive Bash script for installing and configuring an HTTPS proxy (Squid) and a SOCKS5 proxy (Dante) with password or IP white list protection on Ubuntu.
 
 ## Features
 - Supports Ubuntu 22.04 LTS and 24.04 LTS
@@ -21,8 +21,7 @@ An interactive Bash script for installing and configuring an HTTPS proxy (Squid)
 
 ## Installation
 The script installs the necessary packages (`squid`, `dante-server`, `apache2-utils`, `fail2ban`, `ufw`) and optionally `unbound`, then guides you through configuration with comprehensive checks.
-For safety, consider reviewing the script before piping it into bash.
-These commands downloading (or cloning the repo) and running the script from disk.
+These commands downloading script (or cloning the repo), then running the script from disk.
 
 1. Download script or clone the repository:
    ```bash
@@ -44,11 +43,6 @@ These commands downloading (or cloning the repo) and running the script from dis
 3. Run the installer:
    ```bash
    sudo ./proxy-installer.sh
-   ```
-
-If you want to review the script before run:
-   ```bash
-   nano proxy-installer.sh
    ```
 
 DON'T USE one line bash commands that download and stream the installer directly into bash and execute it in one step, because they can't run interactive .SH script menus!!!
