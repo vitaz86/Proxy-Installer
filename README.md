@@ -60,6 +60,7 @@ Follow the prompts to:
 - add whitelisted IP addresses
 - create users and set passwords
 - select ports for Squid and Dante
+- run "sudo unbound-control flush_zone ." to clean DNS cache
 
 After completion, the script displays the connection details for the configured proxies. Running the script again detects existing installations and offers to perform a full cleanup before reinstalling.
 

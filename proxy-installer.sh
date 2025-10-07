@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ====================================================================
-#   Advanced Proxy Installer v4 by vitaz86
+#   Advanced Proxy Installer v6 by vitaz86
 #   Продуманный интерактивный скрипт для безопасной установки и
 #   переустановки Squid, Dante и Fail2ban на Ubuntu 22.04 и 24.04.
 # ====================================================================
@@ -162,6 +162,7 @@ SQUID_CONF="/etc/squid/squid.conf"
     elif [[ "$AUTH_CHOICE" == "2" ]]; then echo "http_access allow authenticated";
     elif [[ "$AUTH_CHOICE" == "3" ]]; then echo "http_access allow whitelist"; fi
     echo "http_access deny all"; echo -e "\nhttp_port $SQUID_PORT"; echo "via off"; echo "forwarded_for off";
+    if [ "$INSTALL_UNBOUND" = true ]; then echo "dns_nameservers 127.0.0.1"; fi
 } > $SQUID_CONF
 
 DANTE_CONF="/etc/danted.conf"
@@ -169,6 +170,7 @@ EXTERNAL_INTERFACE=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
 {
     echo "logoutput: /var/log/danted.log"; echo "internal: 0.0.0.0 port = $DANTE_PORT";
     echo "external: $EXTERNAL_INTERFACE"; echo "user.privileged: root"; echo "user.notprivileged: nobody";
+    if [ "$INSTALL_UNBOUND" = true ]; then echo -e "\nresolve { nameserver 127.0.0.1 }"; fi
     echo -e "\n# Rules"
     if [[ "$AUTH_CHOICE" == "1" ]]; then
         for ip in $WHITELIST_IPS; do echo "client pass { from: $ip/32 to: 0.0.0.0/0 method: none }"; done
