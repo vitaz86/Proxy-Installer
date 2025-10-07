@@ -55,6 +55,7 @@ Examples (BAD for this .SH script):
 
 ## Usage
 Follow the prompts to:
+- Choose whether to apply performance optimizations (system tuning and proxy configurations)
 - Choose the authentication mode (hybrid, password only, or IP whitelist only)
 - Add whitelisted IP addresses (with validation)
 - Create users and set passwords (with validation for usernames)
@@ -78,14 +79,16 @@ The script includes comprehensive optimizations for maximum proxy performance:
 - **Dante**: Tuned thread counts, buffer sizes, and connection timeouts
 
 ### Resource-Aware Optimization
-- **Automatic Detection**: Script detects CPU cores, RAM, and disk space
+- **User Choice**: You can choose whether to apply optimizations during installation
+- **Automatic Detection**: When optimizations are enabled, script detects CPU cores, RAM, and disk space
 - **Low-Resource Mode**: For VPS with ≤2 CPU cores or ≤2 GB RAM, uses conservative settings to prevent overload
 - **High-Performance Mode**: For servers with >2 cores and >2 GB RAM, applies aggressive optimizations
+- **Default Mode**: If optimizations are disabled, uses minimal default configurations
 
 ### Included Configuration Files
-- `squid.conf` / `squid-low.conf`: Squid configurations
-- `danted.conf` / `danted-low.conf`: Dante configurations
-- `system-tune.sh` / `system-tune-low.sh`: System optimization scripts
+- `squid.conf` / `squid-low.conf`: Squid configurations (high-performance / low-resource)
+- `danted.conf` / `danted-low.conf`: Dante configurations (high-performance / low-resource)
+- `system-tune.sh` / `system-tune-low.sh`: System optimization scripts (only applied when optimizations are enabled)
 
 ## Troubleshooting
 - If the script fails with network errors, ensure internet connectivity.

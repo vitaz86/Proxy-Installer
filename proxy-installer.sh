@@ -113,25 +113,29 @@ function install_packages() {
     fi
     echo "Пакеты успешно установлены."
 
-    echo -e "\n${C_YELLOW}--- Шаг 2.5: Применение комплексной оптимизации системы ---${C_RESET}"
-    detect_resources
-    if [ "$LOW_RESOURCE" = true ] && [ -f "system-tune-low.sh" ]; then
-        chmod +x system-tune-low.sh
-        ./system-tune-low.sh
-    elif [ -f "system-tune.sh" ]; then
-        chmod +x system-tune.sh
-        ./system-tune.sh
+    if [ "$APPLY_OPTIMIZATIONS" = true ]; then
+        echo -e "\n${C_YELLOW}--- Шаг 2.5: Применение комплексной оптимизации системы ---${C_RESET}"
+        detect_resources
+        if [ "$LOW_RESOURCE" = true ] && [ -f "system-tune-low.sh" ]; then
+            chmod +x system-tune-low.sh
+            ./system-tune-low.sh
+        elif [ -f "system-tune.sh" ]; then
+            chmod +x system-tune.sh
+            ./system-tune.sh
+        else
+            echo "system-tune.sh not found, applying basic optimizations..."
+            echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+            echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+            echo "net.core.somaxconn = 65536" >> /etc/sysctl.conf
+            echo "net.ipv4.tcp_max_syn_backlog = 65536" >> /etc/sysctl.conf
+            echo "net.ipv4.ip_local_port_range = 1024 65535" >> /etc/sysctl.conf
+            echo "net.core.netdev_max_backlog = 5000" >> /etc/sysctl.conf
+            sysctl -p > /dev/null
+        fi
+        echo "Оптимизация системы успешно применена."
     else
-        echo "system-tune.sh not found, applying basic optimizations..."
-        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-        echo "net.core.somaxconn = 65536" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_max_syn_backlog = 65536" >> /etc/sysctl.conf
-        echo "net.ipv4.ip_local_port_range = 1024 65535" >> /etc/sysctl.conf
-        echo "net.core.netdev_max_backlog = 5000" >> /etc/sysctl.conf
-        sysctl -p > /dev/null
+        echo -e "\n${C_YELLOW}--- Шаг 2.5: Пропуск оптимизации системы (используются настройки по умолчанию) ---${C_RESET}"
     fi
-    echo "Оптимизация системы успешно применена."
 }
 
 function configure_services() {
@@ -147,43 +151,59 @@ function configure_services() {
     if [ -f "$JAIL_LOCAL" ]; then cp "$JAIL_LOCAL" "$JAIL_LOCAL.bak"; fi
     if [ -f "$DANTE_FILTER" ]; then cp "$DANTE_FILTER" "$DANTE_FILTER.bak"; fi
 
-    if [ "$LOW_RESOURCE" = true ] && [ -f "squid-low.conf" ]; then
-        CONFIG_FILE="squid-low.conf"
-    elif [ -f "squid.conf" ]; then
-        CONFIG_FILE="squid.conf"
-    else
-        CONFIG_FILE=""
-    fi
+    if [ "$APPLY_OPTIMIZATIONS" = true ]; then
+        if [ "$LOW_RESOURCE" = true ] && [ -f "squid-low.conf" ]; then
+            CONFIG_FILE="squid-low.conf"
+        elif [ -f "squid.conf" ]; then
+            CONFIG_FILE="squid.conf"
+        else
+            CONFIG_FILE=""
+        fi
 
-    if [ -n "$CONFIG_FILE" ]; then
-        cp $CONFIG_FILE $SQUID_CONF
-        # Customize based on user choices
-        sed -i "s/http_port 3128/http_port $SQUID_PORT/" $SQUID_CONF
-        if [ "$INSTALL_UNBOUND" = true ]; then
-            echo "dns_nameservers 127.0.0.1" >> $SQUID_CONF
-        fi
-        # Add authentication and access rules
-        if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "2" ]]; then
-            sed -i 's/# auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd/auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd/' $SQUID_CONF
-            sed -i 's/# auth_param basic realm "Squid Proxy"/auth_param basic realm "Squid Proxy"/' $SQUID_CONF
-            sed -i 's/# acl authenticated proxy_auth REQUIRED/acl authenticated proxy_auth REQUIRED/' $SQUID_CONF
-        fi
-        if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "3" ]]; then
-            sed -i "s/# acl whitelist src 192.168.1.0\/24/acl whitelist src $WHITELIST_IPS/" $SQUID_CONF
-        fi
-        # Update access rules
-        sed -i 's/# http_access allow whitelist/http_access allow whitelist/' $SQUID_CONF
-        sed -i 's/# http_access allow authenticated/http_access allow authenticated/' $SQUID_CONF
-        if [[ "$AUTH_CHOICE" == "1" ]]; then
-            sed -i 's/http_access allow whitelist/http_access allow whitelist/' $SQUID_CONF
-            sed -i 's/http_access allow authenticated/http_access allow authenticated/' $SQUID_CONF
-        elif [[ "$AUTH_CHOICE" == "2" ]]; then
-            sed -i 's/http_access allow authenticated/http_access allow authenticated/' $SQUID_CONF
-        elif [[ "$AUTH_CHOICE" == "3" ]]; then
-            sed -i 's/http_access allow whitelist/http_access allow whitelist/' $SQUID_CONF
+        if [ -n "$CONFIG_FILE" ]; then
+            cp $CONFIG_FILE $SQUID_CONF
+            # Customize based on user choices
+            sed -i "s/http_port 3128/http_port $SQUID_PORT/" $SQUID_CONF
+            if [ "$INSTALL_UNBOUND" = true ]; then
+                echo "dns_nameservers 127.0.0.1" >> $SQUID_CONF
+            fi
+            # Add authentication and access rules
+            if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "2" ]]; then
+                sed -i 's/# auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd/auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd/' $SQUID_CONF
+                sed -i 's/# auth_param basic realm "Squid Proxy"/auth_param basic realm "Squid Proxy"/' $SQUID_CONF
+                sed -i 's/# acl authenticated proxy_auth REQUIRED/acl authenticated proxy_auth REQUIRED/' $SQUID_CONF
+            fi
+            if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "3" ]]; then
+                sed -i "s/# acl whitelist src 192.168.1.0\/24/acl whitelist src $WHITELIST_IPS/" $SQUID_CONF
+            fi
+            # Update access rules
+            sed -i 's/# http_access allow whitelist/http_access allow whitelist/' $SQUID_CONF
+            sed -i 's/# http_access allow authenticated/http_access allow authenticated/' $SQUID_CONF
+            if [[ "$AUTH_CHOICE" == "1" ]]; then
+                sed -i 's/http_access allow whitelist/http_access allow whitelist/' $SQUID_CONF
+                sed -i 's/http_access allow authenticated/http_access allow authenticated/' $SQUID_CONF
+            elif [[ "$AUTH_CHOICE" == "2" ]]; then
+                sed -i 's/http_access allow authenticated/http_access allow authenticated/' $SQUID_CONF
+            elif [[ "$AUTH_CHOICE" == "3" ]]; then
+                sed -i 's/http_access allow whitelist/http_access allow whitelist/' $SQUID_CONF
+            fi
+        else
+            # Fallback
+            {
+                if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "2" ]]; then
+                    echo "auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd"; echo "auth_param basic realm \"Squid Proxy\""; echo "acl authenticated proxy_auth REQUIRED";
+                fi
+                if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "3" ]]; then echo "acl whitelist src $WHITELIST_IPS"; fi
+                echo -e "\nhttp_access allow localhost"
+                if [[ "$AUTH_CHOICE" == "1" ]]; then echo "http_access allow whitelist"; echo "http_access allow authenticated";
+                elif [[ "$AUTH_CHOICE" == "2" ]]; then echo "http_access allow authenticated";
+                elif [[ "$AUTH_CHOICE" == "3" ]]; then echo "http_access allow whitelist"; fi
+                echo "http_access deny all"; echo -e "\nhttp_port $SQUID_PORT"; echo "via off"; echo "forwarded_for off";
+                if [ "$INSTALL_UNBOUND" = true ]; then echo "dns_nameservers 127.0.0.1"; fi
+            } > $SQUID_CONF
         fi
     else
-        # Fallback to original generation
+        # Default mode: generate minimal config
         {
             if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "2" ]]; then
                 echo "auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd"; echo "auth_param basic realm \"Squid Proxy\""; echo "acl authenticated proxy_auth REQUIRED";
@@ -203,39 +223,58 @@ function configure_services() {
         echo -e "${C_RED}Ошибка: Не удалось определить внешний сетевой интерфейс. Проверьте подключение к интернету.${C_RESET}"
         exit 1
     fi
-    if [ "$LOW_RESOURCE" = true ] && [ -f "danted-low.conf" ]; then
-        CONFIG_FILE="danted-low.conf"
-    elif [ -f "danted.conf" ]; then
-        CONFIG_FILE="danted.conf"
-    else
-        CONFIG_FILE=""
-    fi
+    if [ "$APPLY_OPTIMIZATIONS" = true ]; then
+        if [ "$LOW_RESOURCE" = true ] && [ -f "danted-low.conf" ]; then
+            CONFIG_FILE="danted-low.conf"
+        elif [ -f "danted.conf" ]; then
+            CONFIG_FILE="danted.conf"
+        else
+            CONFIG_FILE=""
+        fi
 
-    if [ -n "$CONFIG_FILE" ]; then
-        cp $CONFIG_FILE $DANTE_CONF
-        # Customize
-        sed -i "s/port = 1080/port = $DANTE_PORT/" $DANTE_CONF
-        sed -i "s/external: eth0/external: $EXTERNAL_INTERFACE/" $DANTE_CONF
-        if [ "$INSTALL_UNBOUND" = true ]; then
-            sed -i 's/# resolve { nameserver 127.0.0.1 }/resolve { nameserver 127.0.0.1 }/' $DANTE_CONF
-        fi
-        # Update rules based on auth choice
-        if [[ "$AUTH_CHOICE" == "1" ]]; then
-            # Add whitelist rules
-            for ip in $WHITELIST_IPS; do
-                sed -i "/client pass { from: 0.0.0.0\/0 to: 0.0.0.0\/0 method: none }/i client pass { from: $ip/32 to: 0.0.0.0/0 method: none }" $DANTE_CONF
-            done
-            sed -i 's/client pass { from: 0.0.0.0\/0 to: 0.0.0.0\/0 method: none }/client pass { from: 0.0.0.0\/0 to: 0.0.0.0\/0 method: username log: error }/' $DANTE_CONF
-        elif [[ "$AUTH_CHOICE" == "2" ]]; then
-            sed -i 's/client pass { from: 0.0.0.0\/0 to: 0.0.0.0\/0 method: none }/client pass { from: 0.0.0.0\/0 to: 0.0.0.0\/0 method: username log: error }/' $DANTE_CONF
-        elif [[ "$AUTH_CHOICE" == "3" ]]; then
-            # Add whitelist rules
-            for ip in $WHITELIST_IPS; do
-                sed -i "/client pass { from: 0.0.0.0\/0 to: 0.0.0.0\/0 method: none }/i client pass { from: $ip/32 to: 0.0.0.0/0 method: none }" $DANTE_CONF
-            done
+        if [ -n "$CONFIG_FILE" ]; then
+            cp $CONFIG_FILE $DANTE_CONF
+            # Customize
+            sed -i "s/port = 1080/port = $DANTE_PORT/" $DANTE_CONF
+            sed -i "s/external: eth0/external: $EXTERNAL_INTERFACE/" $DANTE_CONF
+            if [ "$INSTALL_UNBOUND" = true ]; then
+                sed -i 's/# resolve { nameserver 127.0.0.1 }/resolve { nameserver 127.0.0.1 }/' $DANTE_CONF
+            fi
+            # Update rules based on auth choice
+            if [[ "$AUTH_CHOICE" == "1" ]]; then
+                # Add whitelist rules
+                for ip in $WHITELIST_IPS; do
+                    sed -i "/client pass { from: 0.0.0.0\/0 to: 0.0.0.0\/0 method: none }/i client pass { from: $ip/32 to: 0.0.0.0/0 method: none }" $DANTE_CONF
+                done
+                sed -i 's/client pass { from: 0.0.0.0\/0 to: 0.0.0.0\/0 method: none }/client pass { from: 0.0.0.0\/0 to: 0.0.0.0\/0 method: username log: error }/' $DANTE_CONF
+            elif [[ "$AUTH_CHOICE" == "2" ]]; then
+                sed -i 's/client pass { from: 0.0.0.0\/0 to: 0.0.0.0\/0 method: none }/client pass { from: 0.0.0.0\/0 to: 0.0.0.0\/0 method: username log: error }/' $DANTE_CONF
+            elif [[ "$AUTH_CHOICE" == "3" ]]; then
+                # Add whitelist rules
+                for ip in $WHITELIST_IPS; do
+                    sed -i "/client pass { from: 0.0.0.0\/0 to: 0.0.0.0\/0 method: none }/i client pass { from: $ip/32 to: 0.0.0.0/0 method: none }" $DANTE_CONF
+                done
+            fi
+        else
+            # Fallback
+            {
+                echo "logoutput: /var/log/danted.log"; echo "internal: 0.0.0.0 port = $DANTE_PORT";
+                echo "external: $EXTERNAL_INTERFACE"; echo "user.privileged: root"; echo "user.notprivileged: nobody";
+                if [ "$INSTALL_UNBOUND" = true ]; then echo -e "\nresolve { nameserver 127.0.0.1 }"; fi
+                echo -e "\n# Rules"
+                if [[ "$AUTH_CHOICE" == "1" ]]; then
+                    for ip in $WHITELIST_IPS; do echo "client pass { from: $ip/32 to: 0.0.0.0/0 method: none }"; done
+                    echo "client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 method: username log: error }";
+                elif [[ "$AUTH_CHOICE" == "2" ]]; then echo "client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 method: username log: error }";
+                elif [[ "$AUTH_CHOICE" == "3" ]]; then
+                    for ip in $WHITELIST_IPS; do echo "client pass { from: $ip/32 to: 0.0.0.0/0 method: none }"; done
+                fi
+                echo "client block { from: 0.0.0.0/0 to: 0.0.0.0/0 log: connect error }";
+                echo -e "\npass { from: 0.0.0.0/0 to: 0.0.0.0/0 command: bind connect udpassociate log: error }";
+            } > $DANTE_CONF
         fi
     else
-        # Fallback
+        # Default mode: generate minimal config
         {
             echo "logoutput: /var/log/danted.log"; echo "internal: 0.0.0.0 port = $DANTE_PORT";
             echo "external: $EXTERNAL_INTERFACE"; echo "user.privileged: root"; echo "user.notprivileged: nobody";
@@ -349,6 +388,13 @@ if [ "$DISK_FREE" -lt 500000 ]; then
     echo -e "${C_RED}Ошибка: Недостаточно свободного места на диске (минимум 500MB).${C_RESET}"
     exit 1
 fi
+
+# --- Выбор режима оптимизации ---
+echo -e "\nПрименить оптимизации производительности (тюнинг системы и прокси)?"
+echo "Это улучшит пропускную способность и снизит задержки, но может увеличить использование ресурсов."
+read -p "(y/n): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then APPLY_OPTIMIZATIONS=true; else APPLY_OPTIMIZATIONS=false; fi
 
 # --- Проверка и предложение очистки ---
 if dpkg -s squid &>/dev/null || dpkg -s dante-server &>/dev/null; then
