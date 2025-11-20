@@ -321,9 +321,16 @@ function setup_firewall() {
     # Проверка конфликтов с другими firewall
     if systemctl is-active firewalld --quiet 2>/dev/null; then
         echo -e "${C_YELLOW}Предупреждение: Обнаружен firewalld. UFW может конфликтовать. Рекомендуется отключить firewalld.${C_RESET}"
-        read -p "Продолжить? (y/n): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 0; fi
+        while true; do
+            read -p "Продолжить? (y/n): " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[YyNn]$ ]]; then
+                if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 0; fi
+                break
+            else
+                echo -e "${C_RED}Пожалуйста, введите 'y' или 'n'.${C_RESET}"
+            fi
+        done
     fi
 
     # Резервное копирование правил
@@ -397,26 +404,40 @@ fi
 # --- Выбор режима оптимизации ---
 echo -e "\nПрименить оптимизации производительности (тюнинг системы и прокси)?"
 echo "Это улучшит пропускную способность и снизит задержки, но может увеличить использование ресурсов."
-read -p "(y/n): " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then APPLY_OPTIMIZATIONS=true; else APPLY_OPTIMIZATIONS=false; fi
+while true; do
+    read -p "(y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[YyNn]$ ]]; then
+        if [[ $REPLY =~ ^[Yy]$ ]]; then APPLY_OPTIMIZATIONS=true; else APPLY_OPTIMIZATIONS=false; fi
+        break
+    else
+        echo -e "${C_RED}Пожалуйста, введите 'y' или 'n'.${C_RESET}"
+    fi
+done
 
 # --- Проверка и предложение очистки ---
 if dpkg -s squid &>/dev/null || dpkg -s dante-server &>/dev/null; then
     echo -e "\n${C_YELLOW}Внимание! Обнаружена предыдущая установка Squid или Dante.${C_RESET}"
     echo "Чтобы гарантировать корректную работу, рекомендуется выполнить полную очистку."
     echo "Это удалит пакеты, старые конфигурации и пользователей, связанных с ними."
-    read -p "Выполнить полную очистку и переустановку? (y/n): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo -e "\nВведите имена пользователей, созданных в прошлый раз, чтобы удалить их."
-        read -rp "Можно несколько, через пробел: " USERS_TO_DELETE_INPUT
-        IFS=' ' read -r -a USERS_TO_DELETE <<< "$USERS_TO_DELETE_INPUT"
-        cleanup
-    else
-        echo -e "${C_RED}Установка прервана по вашему желанию.${C_RESET}"
-        exit 0
-    fi
+    while true; do
+        read -p "Выполнить полную очистку и переустановку? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[YyNn]$ ]]; then
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                echo -e "\nВведите имена пользователей, созданных в прошлый раз, чтобы удалить их."
+                read -rp "Можно несколько, через пробел: " USERS_TO_DELETE_INPUT
+                IFS=' ' read -r -a USERS_TO_DELETE <<< "$USERS_TO_DELETE_INPUT"
+                cleanup
+            else
+                echo -e "${C_RED}Установка прервана по вашему желанию.${C_RESET}"
+                exit 0
+            fi
+            break
+        else
+            echo -e "${C_RED}Пожалуйста, введите 'y' или 'n'.${C_RESET}"
+        fi
+    done
 fi
 
 # --- Фаза 1: Сбор данных от пользователя ---
@@ -468,9 +489,16 @@ while true; do
 done
 
 echo -e "\nУстановить Unbound DNS resolver для ускорения DNS-запросов?"
-read -p "(y/n): " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then INSTALL_UNBOUND=true; fi
+while true; do
+    read -p "(y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[YyNn]$ ]]; then
+        if [[ $REPLY =~ ^[Yy]$ ]]; then INSTALL_UNBOUND=true; fi
+        break
+    else
+        echo -e "${C_RED}Пожалуйста, введите 'y' или 'n'.${C_RESET}"
+    fi
+done
 
 echo -e "\n${C_GREEN}Отлично! Начинаем установку...${C_RESET}"
 sleep 2
