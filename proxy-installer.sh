@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ====================================================================
-#   Advanced Proxy Installer v8 by vitaz86
+#   Advanced Proxy Installer v8.1 by vitaz86
 #   Interactive installer for Squid (HTTP/HTTPS forward proxy) and
 #   Dante (SOCKS5) with optional IP whitelist, Fail2ban and Unbound.
 #   Debian 11+ / Ubuntu 20.04+ and derivatives (Mint, Pop!_OS, etc.).
@@ -32,6 +32,8 @@ SYSCTL_FILE="/etc/sysctl.d/99-proxy-installer.conf"
 UNBOUND_DROPIN="/etc/unbound/unbound.conf.d/proxy-installer.conf"
 FAIL2BAN_JAIL="/etc/fail2ban/jail.d/proxy-installer.local"
 FAIL2BAN_FILTER="/etc/fail2ban/filter.d/dante-proxy-installer.conf"
+FAIL2BAN_SQUID_FILTER="/etc/fail2ban/filter.d/squid-proxy-installer.conf"
+DANTE_DROPIN="/etc/systemd/system/danted.service.d/proxy-installer.conf"
 LOGROTATE_FILE="/etc/logrotate.d/danted-proxy-installer"
 SQUID_PASSWD="/etc/squid/passwd"
 SQUID_CONF="/etc/squid/squid.conf"
@@ -49,7 +51,8 @@ DANTE_PORT=""
 EXTERNAL_INTERFACE=""
 EXTERNAL_IPV4=""
 SERVER_IP=""
-SSH_PORT="22"
+SSH_PORTS=()
+IPV6_ENABLED=false
 SQUID_HELPER=""
 PROXY_USER="proxy"
 DANTE_NOPRIV_USER="nobody"
@@ -83,7 +86,7 @@ is_tty() { [[ -t 0 && -t 1 ]]; }
 
 print_banner() {
     echo -e "${C_BLUE}=======================================================${C_RESET}"
-    echo -e "${C_BLUE}==   Advanced Proxy Installer v8 - vitaz86           ==${C_RESET}"
+    echo -e "${C_BLUE}==   Advanced Proxy Installer v8.1 - vitaz86         ==${C_RESET}"
     echo -e "${C_BLUE}=======================================================${C_RESET}"
     echo
     echo "Установка Squid (HTTP/HTTPS CONNECT) и Dante (SOCKS5)"
@@ -133,6 +136,18 @@ validate_port() {
     return 0
 }
 
+normalize_port() {
+    echo "$((10#$1))"
+}
+
+is_ssh_port() {
+    local port="$1" known
+    for known in "${SSH_PORTS[@]}"; do
+        [[ "$port" == "$known" ]] && return 0
+    done
+    return 1
+}
+
 validate_username() {
     local username="$1"
     local reserved="root daemon bin sys sync games man lp mail news uucp proxy www-data backup list nobody nogroup squid squid3 danted sockd unbound fail2ban sshd systemd-network systemd-resolve ubuntu admin debian user guest dnsmasq _apt"
@@ -167,8 +182,21 @@ _ipv4_ok() {
     return 0
 }
 
+normalize_ip_list() {
+    local raw="$1"
+    raw="${raw//,/ }"
+    raw="${raw//;/ }"
+    raw="$(printf '%s' "$raw" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')"
+    printf '%s' "$raw"
+}
+
 validate_ip_or_cidr() {
     local input="$1" addr prefix
+
+    if [[ "$input" == *","* || "$input" == *";"* ]]; then
+        log_err "Перечисляйте адреса через пробел: $input"
+        return 1
+    fi
 
     # Reject "IP:port" — that was previously accepted and then written into ACLs.
     if [[ "$input" == *:* && "$input" != *:*:* && "$input" == *.* ]]; then
@@ -289,7 +317,7 @@ detect_os() {
     [[ "$debian_like" == true ]] || die "Этот скрипт поддерживает Debian, Ubuntu и производные. Обнаружено: ${OS_ID:-unknown} ${OS_VERSION_ID}"
 
     case "$OS_ID" in
-        ubuntu|linuxmint|pop|elementary|zorin|neon|kubuntu|xubuntu|lubuntu)
+        ubuntu)
             local major="${OS_VERSION_ID%%.*}"
             if [[ "$major" =~ ^[0-9]+$ ]] && ((major < 20)); then
                 die "Нужен Ubuntu 20.04 или новее (сейчас ${OS_VERSION_ID})."
@@ -300,6 +328,14 @@ detect_os() {
             if [[ "$major" =~ ^[0-9]+$ ]] && ((major < 11)); then
                 die "Нужен Debian 11 или новее (сейчас ${OS_VERSION_ID})."
             fi
+            ;;
+    esac
+
+    # Derivatives (Mint, Zorin, elementary, Pop!_OS) use their own VERSION_ID.
+    # Reject them only when the Ubuntu base is older than 20.04.
+    case "${UBUNTU_CODENAME:-}" in
+        precise|trusty|xenial|bionic)
+            die "База Ubuntu слишком старая (${UBUNTU_CODENAME}). Нужен Ubuntu 20.04 (focal) или новее."
             ;;
     esac
 
@@ -346,14 +382,59 @@ detect_nologin() {
 }
 
 detect_ssh_port() {
-    local port=""
+    local port="" seen=" "
+    SSH_PORTS=()
+
+    add_ssh_port() {
+        local candidate="${1:-}"
+        validate_port "$candidate" 2>/dev/null || return 0
+        candidate="$(normalize_port "$candidate")"
+        [[ "$seen" == *" $candidate "* ]] && return 0
+        seen+="$candidate "
+        SSH_PORTS+=("$candidate")
+    }
+
     if command_exists sshd; then
-        port="$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')"
+        while read -r port; do
+            add_ssh_port "$port"
+        done < <(sshd -T 2>/dev/null | awk '/^port / {print $2}')
     fi
-    if [[ -z "$port" && -f /etc/ssh/sshd_config ]]; then
-        port="$(awk 'BEGIN{IGNORECASE=1} /^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config)"
+    if command_exists ss; then
+        while read -r port; do
+            add_ssh_port "$port"
+        done < <(ss -lntupH 2>/dev/null | awk '/sshd/ {
+            addr=$5
+            sub(/.*:/, "", addr)
+            gsub(/\]/, "", addr)
+            print addr
+        }')
     fi
-    SSH_PORT="${port:-22}"
+    if ((${#SSH_PORTS[@]} == 0)); then
+        if [[ -f /etc/ssh/sshd_config ]]; then
+            port="$(awk 'BEGIN{IGNORECASE=1} /^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config)"
+            add_ssh_port "$port"
+        fi
+    fi
+    if ((${#SSH_PORTS[@]} == 0)); then
+        SSH_PORTS=(22)
+    fi
+}
+
+ipv6_is_enabled() {
+    [[ -f /proc/net/if_inet6 ]] || return 1
+    local disabled="0"
+    disabled="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)"
+    [[ "$disabled" == "0" ]]
+}
+
+ensure_iproute() {
+    if command_exists ip && command_exists ss; then
+        return 0
+    fi
+    log_info "Ставлю iproute2, чтобы проверить интерфейс и занятые порты."
+    apt-get update -qq -o Acquire::Retries=3 || die "Не удалось обновить списки пакетов (apt-get update)."
+    apt-get install -y -qq iproute2 || die "Не удалось установить iproute2. Без него нельзя надёжно выбрать свободный порт."
+    command_exists ss || die "После установки iproute2 команда ss недоступна."
 }
 
 detect_external_net() {
@@ -442,14 +523,17 @@ state_get() {
 }
 
 state_set() {
-    local key="$1" value="$2"
+    local key="$1" value="$2" tmp
     mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
     touch "$STATE_FILE"
-    if grep -q "^${key}=" "$STATE_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=${value}|" "$STATE_FILE"
-    else
-        echo "${key}=${value}" >> "$STATE_FILE"
+    tmp="$(mktemp)"
+    if [[ -f "$STATE_FILE" ]]; then
+        grep -v "^${key}=" "$STATE_FILE" > "$tmp" || true
     fi
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    mv "$tmp" "$STATE_FILE"
+    chmod 600 "$STATE_FILE" 2>/dev/null || true
 }
 
 remember_user() {
@@ -470,10 +554,44 @@ read_tracked_users() {
 # ====================================================================
 
 remove_ufw_port() {
-    local port="$1"
+    local port="$1" _
     command_exists ufw || return 0
-    ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
-    ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
+    for _ in 1 2 3 4; do
+        ufw --force delete allow "${port}/tcp" >/dev/null 2>&1 || break
+    done
+    for _ in 1 2 3 4; do
+        ufw --force delete allow "${port}/udp" >/dev/null 2>&1 || break
+    done
+}
+
+remove_firewalld_port() {
+    local port="$1" proto
+    command_exists firewall-cmd || return 0
+    systemctl is-active firewalld >/dev/null 2>&1 || return 0
+    for proto in tcp udp; do
+        firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
+    done
+}
+
+safe_delete_user() {
+    local user="$1" uid home
+    [[ -n "$user" ]] || return 0
+    id "$user" >/dev/null 2>&1 || return 0
+    if ! validate_username "$user" >/dev/null 2>&1; then
+        log_err "Отказ удалять системную учётную запись '$user'."
+        return 1
+    fi
+    uid="$(id -u "$user")"
+    if [[ "$uid" == "0" ]]; then
+        log_err "Отказ удалять root."
+        return 1
+    fi
+    home="$(getent passwd "$user" | cut -d: -f6)"
+    case "$home" in
+        /|/root|/home|/etc|/usr|/var|"") userdel "$user" >/dev/null 2>&1 || true ;;
+        *) userdel -r "$user" >/dev/null 2>&1 || userdel "$user" >/dev/null 2>&1 || true ;;
+    esac
+    log_info "Пользователь '$user' удалён."
 }
 
 cleanup() {
@@ -484,6 +602,11 @@ cleanup() {
     old_dante="$(state_get DANTE_PORT)"
     [[ -n "$old_squid" ]] && remove_ufw_port "$old_squid"
     [[ -n "$old_dante" ]] && remove_ufw_port "$old_dante"
+    [[ -n "$old_squid" ]] && remove_firewalld_port "$old_squid"
+    [[ -n "$old_dante" ]] && remove_firewalld_port "$old_dante"
+    if command_exists firewall-cmd && systemctl is-active firewalld >/dev/null 2>&1; then
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
 
     systemctl stop squid danted 2>/dev/null || true
     systemctl disable squid danted 2>/dev/null || true
@@ -492,12 +615,22 @@ cleanup() {
     apt-get purge -y squid dante-server >/dev/null 2>&1 || true
 
     if [[ "$(state_get INSTALLED_UNBOUND)" == "1" ]]; then
-        systemctl stop unbound 2>/dev/null || true
-        apt-get purge -y unbound >/dev/null 2>&1 || true
+        if [[ "$(state_get UNBOUND_PREEXISTED)" != "1" ]]; then
+            systemctl stop unbound 2>/dev/null || true
+            apt-get purge -y unbound >/dev/null 2>&1 || true
+        fi
     fi
     rm -f "$UNBOUND_DROPIN"
+    if [[ "$(state_get UNBOUND_PREEXISTED)" == "1" ]] && systemctl is-enabled unbound >/dev/null 2>&1; then
+        systemctl try-restart unbound >/dev/null 2>&1 || true
+    fi
 
-    rm -f "$FAIL2BAN_JAIL" "$FAIL2BAN_FILTER"
+    rm -f "$FAIL2BAN_JAIL" "$FAIL2BAN_FILTER" "$FAIL2BAN_SQUID_FILTER"
+    rm -f "$DANTE_DROPIN"
+    rmdir /etc/systemd/system/danted.service.d 2>/dev/null || true
+    if command_exists systemctl; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
     if systemctl is-active fail2ban >/dev/null 2>&1; then
         systemctl reload fail2ban >/dev/null 2>&1 || systemctl restart fail2ban >/dev/null 2>&1 || true
     fi
@@ -516,10 +649,7 @@ cleanup() {
     fi
     for user in "${tracked[@]}"; do
         [[ -n "$user" ]] || continue
-        if id "$user" >/dev/null 2>&1; then
-            userdel -r "$user" >/dev/null 2>&1 || userdel "$user" >/dev/null 2>&1 || true
-            log_info "Пользователь '$user' удалён."
-        fi
+        safe_delete_user "$user" || true
     done
 
     rm -f "$SQUID_PASSWD" "$SYSCTL_FILE" "$LOGROTATE_FILE" "$DANTE_LOG"
@@ -544,17 +674,18 @@ install_packages() {
     local pkgs=(squid dante-server apache2-utils fail2ban)
     command_exists curl || pkgs+=(curl)
     command_exists ip && command_exists ss || pkgs+=(iproute2)
+    [[ "$INSTALL_UNBOUND" == true ]] && pkgs+=(unbound)
 
-    local fail2ban_existed=0
+    local fail2ban_existed=0 unbound_existed=0
     dpkg -s fail2ban >/dev/null 2>&1 && fail2ban_existed=1
+    dpkg -s unbound >/dev/null 2>&1 && unbound_existed=1
 
     apt_install "${pkgs[@]}"
     state_set INSTALLED_FAIL2BAN 1
     state_set FAIL2BAN_PREEXISTED "$fail2ban_existed"
-
     if [[ "$INSTALL_UNBOUND" == true ]]; then
-        apt_install unbound
         state_set INSTALLED_UNBOUND 1
+        state_set UNBOUND_PREEXISTED "$unbound_existed"
     fi
     log_ok "Пакеты установлены."
 }
@@ -639,7 +770,17 @@ server:
 EOF
 
     if ! unbound-checkconf >/dev/null 2>&1; then
-        log_warn "unbound-checkconf сообщил об ошибке. Проверьте $UNBOUND_DROPIN."
+        local check_out
+        check_out="$(unbound-checkconf 2>&1 || true)"
+        if [[ "$check_out" == *"root.key"* || "$check_out" == *"auto-trust-anchor-file"* ]]; then
+            log_info "Ключ DNSSEC ещё не создан. Unbound создаст его при первом запуске."
+        else
+            log_warn "unbound-checkconf сообщил об ошибке. Локальный DNS не будет включён."
+            printf '%s\n' "$check_out" >&2
+            rm -f "$UNBOUND_DROPIN"
+            INSTALL_UNBOUND=false
+            return 0
+        fi
     fi
     log_ok "Unbound настроен на 127.0.0.1:53 (без публикации резолвера в интернет)."
 }
@@ -648,18 +789,16 @@ EOF
 # Service configs
 # ====================================================================
 
-configure_squid() {
-    backup_file "$SQUID_CONF"
-    detect_squid_helper || die "Не найден helper basic_ncsa_auth. Пакет squid установлен неполностью."
-    detect_proxy_user
+write_squid_conf() {
+    local auth_block="" access_block="" dns_block="" self_acl="" self_deny="" port_block helper
+    helper="${SQUID_HELPER:-/usr/lib/squid/basic_ncsa_auth}"
 
-    local auth_block="" access_block="" dns_block=""
     if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "2" ]]; then
         auth_block=$(cat <<EOF
-auth_param basic program ${SQUID_HELPER} ${SQUID_PASSWD}
+auth_param basic program ${helper} ${SQUID_PASSWD}
+auth_param basic children 5
 auth_param basic realm Squid Proxy
 auth_param basic credentialsttl 2 hours
-auth_param basic children 5
 acl authenticated proxy_auth REQUIRED
 EOF
 )
@@ -675,18 +814,27 @@ EOF
         3) access_block='http_access allow whitelist' ;;
     esac
 
+    if [[ -n "${SERVER_IP:-}" && "$SERVER_IP" != "unknown" ]]; then
+        self_acl="acl to_self dst ${SERVER_IP}"
+        self_deny="http_access deny to_self"
+    fi
+
     if [[ "$INSTALL_UNBOUND" == true ]]; then
         dns_block="dns_nameservers 127.0.0.1"
     fi
 
+    port_block="http_port ${SQUID_PORT}"
+    if [[ "$IPV6_ENABLED" == true ]]; then
+        port_block+=$'\n'"http_port [::]:${SQUID_PORT}"
+    fi
+
     cat > "$SQUID_CONF" <<EOF
-# Generated by proxy-installer v8
-visible_hostname proxy
+# Generated by proxy-installer v8.1
+# localhost, to_localhost, to_linklocal and CONNECT are built into Squid.
+logfile_rotate 0
 httpd_suppress_version_string on
 coredump_dir /var/spool/squid
 
-acl localhost src 127.0.0.1/32 ::1
-acl to_localhost dst 127.0.0.0/8 0.0.0.0/32 ::1
 acl SSL_ports port 443
 acl Safe_ports port 80
 acl Safe_ports port 21
@@ -698,24 +846,28 @@ acl Safe_ports port 280
 acl Safe_ports port 488
 acl Safe_ports port 591
 acl Safe_ports port 777
-acl CONNECT method CONNECT
 
 ${auth_block}
+${self_acl}
 
 http_access deny !Safe_ports
 http_access deny CONNECT !SSL_ports
 http_access allow localhost
 http_access deny to_localhost
+http_access deny to_linklocal
+${self_deny}
 ${access_block}
 http_access deny all
 
-http_port ${SQUID_PORT}
+${port_block}
 via off
 forwarded_for delete
 request_header_access From deny all
 request_header_access Server deny all
-request_header_access WWW-Authenticate deny all
 request_header_access Link deny all
+
+logformat proxyinstaller %tl %>a %Ss/%03>Hs %rm %ru %un
+access_log stdio:/var/log/squid/access.log proxyinstaller
 
 refresh_pattern ^ftp:           1440    20%     10080
 refresh_pattern ^gopher:        1440    0%      1440
@@ -725,6 +877,16 @@ refresh_pattern .               0       20%     4320
 shutdown_lifetime 5 seconds
 ${dns_block}
 EOF
+}
+
+configure_squid() {
+    backup_file "$SQUID_CONF"
+    detect_proxy_user
+    detect_external_net || true
+    if [[ "$AUTH_CHOICE" == "1" || "$AUTH_CHOICE" == "2" ]]; then
+        detect_squid_helper || die "Не найден helper basic_ncsa_auth. Пакет squid установлен неполностью."
+    fi
+    write_squid_conf
 
     if [[ -f "$SQUID_PASSWD" ]]; then
         chown "root:${PROXY_USER}" "$SQUID_PASSWD"
@@ -732,111 +894,121 @@ EOF
     fi
 
     mkdir -p /var/spool/squid /var/log/squid
+    touch /var/log/squid/access.log
     chown -R "${PROXY_USER}:${PROXY_USER}" /var/spool/squid /var/log/squid 2>/dev/null || true
+    chmod 755 /var/log/squid 2>/dev/null || true
+
+    local parse_out=""
+    if ! parse_out="$(squid -k parse -f "$SQUID_CONF" 2>&1)"; then
+        if grep -q 'to_linklocal' <<<"$parse_out"; then
+            sed -i '/to_linklocal/d' "$SQUID_CONF"
+            parse_out="$(squid -k parse -f "$SQUID_CONF" 2>&1)" || {
+                printf '%s\n' "$parse_out" >&2
+                die "squid -k parse не принял ${SQUID_CONF}."
+            }
+        else
+            printf '%s\n' "$parse_out" >&2
+            die "squid -k parse не принял ${SQUID_CONF}."
+        fi
+    fi
     if [[ ! -d /var/spool/squid/00 ]]; then
         squid -z --foreground >/dev/null 2>&1 || squid -z >/dev/null 2>&1 || true
     fi
-
-    if ! squid -k parse >/dev/null 2>&1; then
-        log_err "squid -k parse не принял конфигурацию. Фрагмент ошибки:"
-        squid -k parse || true
-        die "Исправьте ${SQUID_CONF} и повторите установку."
-    fi
-    log_ok "Squid: конфиг проверен (safe ports, скрытие заголовков, helper ${SQUID_HELPER})."
+    log_ok "Squid: конфиг проверен (safe ports, свой журнал для Fail2ban)."
 }
 
-configure_dante() {
-    backup_file "$DANTE_CONF"
-    detect_external_net
-    detect_dante_unprivileged
-    ensure_dante_log
+dante_pass_block() {
+    local from="$1" to="$2" method="$3"
+    printf 'socks pass {\n    from: %s to: %s\n    socksmethod: %s\n    command: connect udpassociate\n    log: error\n}\n' "$from" "$to" "$method"
+}
 
-    local external_line="external: ${EXTERNAL_INTERFACE}"
-    if [[ -n "$EXTERNAL_IPV4" ]]; then
+dante_client_block() {
+    local from="$1" to="$2"
+    printf 'client pass {\n    from: %s to: %s\n    log: error\n}\n' "$from" "$to"
+}
+
+write_dante_conf() {
+    local external_line="external: ${EXTERNAL_INTERFACE:-eth0}"
+    if [[ -n "${EXTERNAL_IPV4:-}" ]]; then
         external_line="external: ${EXTERNAL_IPV4}"
     fi
 
-    local socks_method client_rules socks_rules
+    local internal_block="internal: 0.0.0.0 port = ${DANTE_PORT}"
+    local v6_clients="" v6_socks_user=""
+    if [[ "$IPV6_ENABLED" == true ]]; then
+        internal_block+=$'\n'"internal: :: port = ${DANTE_PORT}"
+        v6_clients="$(dante_client_block "::/0" "::/0")"
+        v6_socks_user="$(dante_pass_block "::/0" "::/0" "username")"
+    fi
+
+    local socks_method="" client_rules="" socks_rules="" ip from to warned_v6=false
     case "$AUTH_CHOICE" in
         1)
             socks_method="socksmethod: username none"
-            client_rules="$(cat <<EOF
-client pass {
-    from: 0.0.0.0/0 to: 0.0.0.0/0
-    log: error
-}
-EOF
-)"
+            client_rules="$(dante_client_block "0.0.0.0/0" "0.0.0.0/0")"$'\n'
+            [[ "$IPV6_ENABLED" == true ]] && client_rules+="${v6_clients}"$'\n'
             socks_rules=""
-            local ip
             for ip in $WHITELIST_IPS; do
-                socks_rules+="socks pass {
-    from: $(cidr_for "$ip") to: 0.0.0.0/0
-    socksmethod: none
-    command: connect udpassociate
-    log: error
-}
-"
+                from="$(cidr_for "$ip")"
+                if is_ipv6 "$ip"; then
+                    if [[ "$IPV6_ENABLED" != true ]]; then
+                        warned_v6=true
+                        continue
+                    fi
+                    to="::/0"
+                else
+                    to="0.0.0.0/0"
+                fi
+                socks_rules+="$(dante_pass_block "$from" "$to" "none")"$'\n'
             done
-            socks_rules+="$(cat <<EOF
-socks pass {
-    from: 0.0.0.0/0 to: 0.0.0.0/0
-    socksmethod: username
-    command: connect udpassociate
-    log: error
-}
-EOF
-)"
+            socks_rules+="$(dante_pass_block "0.0.0.0/0" "0.0.0.0/0" "username")"$'\n'
+            [[ "$IPV6_ENABLED" == true ]] && socks_rules+="${v6_socks_user}"$'\n'
             ;;
         2)
             socks_method="socksmethod: username"
-            client_rules="$(cat <<EOF
-client pass {
-    from: 0.0.0.0/0 to: 0.0.0.0/0
-    log: error
-}
-EOF
-)"
-            socks_rules="$(cat <<EOF
-socks pass {
-    from: 0.0.0.0/0 to: 0.0.0.0/0
-    socksmethod: username
-    command: connect udpassociate
-    log: error
-}
-EOF
-)"
+            client_rules="$(dante_client_block "0.0.0.0/0" "0.0.0.0/0")"$'\n'
+            [[ "$IPV6_ENABLED" == true ]] && client_rules+="${v6_clients}"$'\n'
+            socks_rules="$(dante_pass_block "0.0.0.0/0" "0.0.0.0/0" "username")"$'\n'
+            [[ "$IPV6_ENABLED" == true ]] && socks_rules+="${v6_socks_user}"$'\n'
             ;;
         3)
             socks_method="socksmethod: none"
             client_rules=""
             socks_rules=""
-            local ip
             for ip in $WHITELIST_IPS; do
-                client_rules+="client pass {
-    from: $(cidr_for "$ip") to: 0.0.0.0/0
-    log: error
-}
-"
-                socks_rules+="socks pass {
-    from: $(cidr_for "$ip") to: 0.0.0.0/0
-    socksmethod: none
-    command: connect udpassociate
-    log: error
-}
-"
+                from="$(cidr_for "$ip")"
+                if is_ipv6 "$ip"; then
+                    if [[ "$IPV6_ENABLED" != true ]]; then
+                        warned_v6=true
+                        continue
+                    fi
+                    to="::/0"
+                else
+                    to="0.0.0.0/0"
+                fi
+                client_rules+="$(dante_client_block "$from" "$to")"$'\n'
+                socks_rules+="$(dante_pass_block "$from" "$to" "none")"$'\n'
             done
             ;;
     esac
+    if [[ "$warned_v6" == true ]]; then
+        log_warn "IPv6 на сервере выключен. IPv6-адреса белого списка записаны только в Squid."
+    fi
 
+    if [[ "$AUTH_CHOICE" == "3" && -z "${socks_rules//[[:space:]]/}" ]]; then
+        log_err "Dante не получил ни одного применимого адреса белого списка."
+        return 1
+    fi
+
+    local nopriv="${DANTE_NOPRIV_USER:-nobody}"
     cat > "$DANTE_CONF" <<EOF
-# Generated by proxy-installer v8
-# Username auth is socksmethod (SOCKS RFC 1929), not clientmethod.
-logoutput: syslog ${DANTE_LOG}
-internal: 0.0.0.0 port = ${DANTE_PORT}
+# Generated by proxy-installer v8.1
+# Username auth is socksmethod (SOCKS RFC 1929), not a client-rule method.
+logoutput: ${DANTE_LOG}
+${internal_block}
 ${external_line}
 user.privileged: root
-user.notprivileged: ${DANTE_NOPRIV_USER}
+user.unprivileged: ${nopriv}
 clientmethod: none
 ${socks_method}
 
@@ -852,6 +1024,31 @@ socks block {
     log: connect error
 }
 EOF
+}
+
+configure_dante() {
+    backup_file "$DANTE_CONF"
+    detect_external_net
+    detect_dante_unprivileged
+    ensure_dante_log
+    write_dante_conf || die "Конфигурация Dante не собрана."
+
+    if ! danted -f "$DANTE_CONF" -V >/dev/null 2>&1; then
+        sed -i 's/^user\.unprivileged:/user.notprivileged:/' "$DANTE_CONF"
+        if ! danted -f "$DANTE_CONF" -V >/dev/null 2>&1; then
+            log_err "danted -V не принял ${DANTE_CONF}. Последние строки ${DANTE_LOG}:"
+            tail -n 40 "$DANTE_LOG" >&2 || true
+            die "Проверьте внешний адрес и правила Dante."
+        fi
+    fi
+
+    mkdir -p /etc/systemd/system/danted.service.d
+    cat > "$DANTE_DROPIN" <<EOF
+[Service]
+# The packaged unit makes /var read-only. Allow the Dante log file.
+ReadWritePaths=${DANTE_LOG}
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
 
     cat > "$LOGROTATE_FILE" <<EOF
 ${DANTE_LOG} {
@@ -861,10 +1058,7 @@ ${DANTE_LOG} {
     notifempty
     compress
     delaycompress
-    sharedscripts
-    postrotate
-        systemctl kill -s HUP danted.service >/dev/null 2>&1 || true
-    endscript
+    copytruncate
 }
 EOF
 
@@ -882,18 +1076,27 @@ configure_fail2ban() {
 
     cat > "$FAIL2BAN_FILTER" <<'EOF'
 [Definition]
-# Dante 1.4 logs authentication/policy blocks with the client IP as a.b.c.d.port
-failregex = ^\s*(?:\S+\s+\S+\s+)?(?:error|info): block\(\d+\): tcp/accept \[: <HOST>\.\d+\]:
-            ^\s*(?:\S+\s+\S+\s+)?error: .*\[: <HOST>\.\d+\]:.*(?:authentication failed|password)
+# Dante 1.4.3 file log:
+# Oct 23 22:06:46 (epoch) danted[pid]: info: block(1): tcp/accept ]: 203.0.113.5.54321 ...
+failregex = info: block\(\d+\): tcp/accept \]: <HOST>\.\d+
 ignoreregex =
 EOF
 
+    cat > "$FAIL2BAN_SQUID_FILTER" <<'EOF'
+[Definition]
+# logformat proxyinstaller %tl %>a %Ss/%03>Hs %rm %ru %un
+failregex = ^\s*<HOST> [A-Z_]+_DENIED/\d+
+ignoreregex =
+EOF
+
+    mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d
     cat > "$FAIL2BAN_JAIL" <<EOF
-[squid]
+[squid-proxy-installer]
 enabled = true
+filter = squid-proxy-installer
 port = ${SQUID_PORT}
 logpath = /var/log/squid/access.log
-backend = auto
+backend = polling
 bantime = 2h
 findtime = 10m
 maxretry = 8
@@ -922,19 +1125,32 @@ setup_firewall() {
     echo -e "\n${C_YELLOW}--- Настройка firewall ---${C_RESET}"
     detect_ssh_port
 
+    local prev_squid prev_dante ssh_port
+    prev_squid="$(state_get SQUID_PORT)"
+    prev_dante="$(state_get DANTE_PORT)"
+
     if systemctl is-active firewalld >/dev/null 2>&1 && command_exists firewall-cmd; then
         log_info "Обнаружен firewalld — правила будут добавлены в него (UFW не включается)."
+        if [[ -n "$prev_squid" && "$prev_squid" != "$SQUID_PORT" ]]; then
+            remove_firewalld_port "$prev_squid"
+        fi
+        if [[ -n "$prev_dante" && "$prev_dante" != "$DANTE_PORT" ]]; then
+            remove_firewalld_port "$prev_dante"
+        fi
         firewall-cmd --permanent --add-port="${SQUID_PORT}/tcp" >/dev/null
         firewall-cmd --permanent --add-port="${DANTE_PORT}/tcp" >/dev/null
         firewall-cmd --permanent --add-port="${DANTE_PORT}/udp" >/dev/null
-        firewall-cmd --permanent --add-port="${SSH_PORT}/tcp" >/dev/null || true
+        for ssh_port in "${SSH_PORTS[@]}"; do
+            firewall-cmd --permanent --add-port="${ssh_port}/tcp" >/dev/null || true
+        done
         firewall-cmd --reload >/dev/null
-        log_ok "firewalld: открыты ${SQUID_PORT}/tcp, ${DANTE_PORT}/tcp+udp, SSH ${SSH_PORT}/tcp."
+        save_runtime_state
+        log_ok "firewalld: открыты ${SQUID_PORT}/tcp, ${DANTE_PORT}/tcp+udp, SSH ${SSH_PORTS[*]}."
         return 0
     fi
 
     if ! dpkg -s ufw >/dev/null 2>&1; then
-        apt-get install -y -qq ufw >/dev/null || { log_warn "Не удалось установить ufw. Откройте порты вручную."; return 0; }
+        apt-get install -y -qq ufw >/dev/null || { log_warn "Не удалось установить ufw. Откройте порты вручную."; save_runtime_state; return 0; }
     fi
 
     local ufw_was_active=false
@@ -945,40 +1161,118 @@ setup_firewall() {
     mkdir -p /etc/ufw
     ufw status numbered > /etc/ufw/ufw.rules.backup 2>/dev/null || true
 
-    ufw allow "${SSH_PORT}/tcp" comment "SSH (proxy-installer)" >/dev/null
-    ufw allow OpenSSH >/dev/null 2>&1 || true
+    if [[ -n "$prev_squid" && "$prev_squid" != "$SQUID_PORT" ]]; then
+        remove_ufw_port "$prev_squid"
+    fi
+    if [[ -n "$prev_dante" && "$prev_dante" != "$DANTE_PORT" ]]; then
+        remove_ufw_port "$prev_dante"
+    fi
+
+    for ssh_port in "${SSH_PORTS[@]}"; do
+        ufw allow "${ssh_port}/tcp" comment "SSH (proxy-installer)" >/dev/null
+    done
     ufw allow "${SQUID_PORT}/tcp" comment "Squid HTTP proxy" >/dev/null
     ufw allow "${DANTE_PORT}/tcp" comment "Dante SOCKS5" >/dev/null
     ufw allow "${DANTE_PORT}/udp" comment "Dante UDP ASSOCIATE" >/dev/null
 
     if [[ "$ufw_was_active" == true ]]; then
         ufw reload >/dev/null
-        log_ok "UFW был активен: добавлены порты прокси, SSH ${SSH_PORT}/tcp сохранён."
+        save_runtime_state
+        log_ok "UFW был активен: добавлены порты прокси, SSH (${SSH_PORTS[*]}) сохранён."
         return 0
     fi
 
     if [[ "$ENABLE_UFW" == true ]]; then
+        local status_text
+        status_text="$(ufw status 2>/dev/null || true)"
+        for ssh_port in "${SSH_PORTS[@]}"; do
+            if ! grep -q "${ssh_port}/tcp" <<<"$status_text"; then
+                die "Правило SSH ${ssh_port}/tcp не появилось в UFW. Включение firewall отменено, чтобы не потерять доступ."
+            fi
+        done
         ufw --force enable >/dev/null
-        log_ok "UFW включён. Перед этим явно разрешён SSH (${SSH_PORT}/tcp), чтобы не потерять доступ."
+        log_ok "UFW включён. Перед этим явно разрешён SSH (${SSH_PORTS[*]})."
     else
         log_warn "UFW не был активен и не включался. Правила добавлены, но фильтр выключен."
-        log_warn "Включите его позже: ufw enable (SSH ${SSH_PORT} уже разрешён)."
+        log_warn "Включите его позже: ufw enable (SSH ${SSH_PORTS[*]} уже разрешён)."
     fi
+    save_runtime_state
+}
+
+save_runtime_state() {
+    state_set SQUID_PORT "$SQUID_PORT"
+    state_set DANTE_PORT "$DANTE_PORT"
+    state_set AUTH_CHOICE "$AUTH_CHOICE"
 }
 
 # ====================================================================
 # Users / services
 # ====================================================================
 
+read_password_twice() {
+    local user="$1" first="" second=""
+    while true; do
+        read -r -s -p "   Пароль для '$user' (и Squid, и Dante, минимум 8 символов): " first || return 1
+        printf '\n' >&2
+        read -r -s -p "   Повтор пароля: " second || return 1
+        printf '\n' >&2
+        if [[ "$first" != "$second" ]]; then
+            log_err "Пароли не совпали."
+            continue
+        fi
+        if ((${#first} < 8)); then
+            log_err "Пароль короче 8 символов."
+            continue
+        fi
+        if [[ "$first" == "$user" ]]; then
+            log_err "Пароль не должен совпадать с именем пользователя."
+            continue
+        fi
+        if [[ "$first" == *$'\n'* ]]; then
+            log_err "Пароль не должен содержать перевод строки."
+            continue
+        fi
+        printf '%s' "$first"
+        return 0
+    done
+}
+
+retire_stale_proxy_users() {
+    local old="" keep current
+    local existing=()
+    mapfile -t existing < <(read_tracked_users)
+    for old in "${existing[@]}"; do
+        [[ -n "$old" ]] || continue
+        keep=false
+        for current in "${USERS[@]}"; do
+            if [[ "$current" == "$old" ]]; then
+                keep=true
+                break
+            fi
+        done
+        if [[ "$keep" == false ]]; then
+            log_info "Удаляю учётную запись '$old': её нет в новом списке."
+            safe_delete_user "$old" || true
+            if [[ -f "$USERS_FILE" ]]; then
+                grep -vxF "$old" "$USERS_FILE" > "${USERS_FILE}.tmp" || true
+                mv "${USERS_FILE}.tmp" "$USERS_FILE"
+            fi
+        fi
+    done
+}
+
 create_or_update_users() {
+    retire_stale_proxy_users
+    if [[ "$AUTH_CHOICE" == "3" ]]; then
+        rm -f "$SQUID_PASSWD"
+    fi
     ((${#USERS[@]} > 0)) || return 0
     echo -e "\n${C_YELLOW}--- Шаг 3: Пользователи и пароли ---${C_RESET}"
     detect_nologin
     mkdir -p /etc/squid
+    rm -f "$SQUID_PASSWD"
 
-    local user first_htpasswd=true
-    [[ -s "$SQUID_PASSWD" ]] && first_htpasswd=false
-
+    local user password first_htpasswd=true
     for user in "${USERS[@]}"; do
         echo "-> Пользователь '$user'"
         if id "$user" >/dev/null 2>&1; then
@@ -988,28 +1282,37 @@ create_or_update_users() {
                 die "Пользователь '$user' уже существует и не был создан этим скриптом."
             fi
         else
-            useradd --no-create-home --shell "$NOLOGIN_SHELL" --comment "proxy-installer" "$user" \
+            useradd --system --no-create-home --shell "$NOLOGIN_SHELL" --comment "proxy-installer" "$user" \
                 || die "Не удалось создать пользователя '$user'."
             remember_user "$user"
         fi
 
         chage -m 0 -M 99999 -I -1 -E -1 "$user" >/dev/null 2>&1 || true
-
-        echo "   Пароль для Dante (SOCKS5, системный passwd):"
-        passwd "$user" || die "Не удалось задать пароль для '$user'."
-
-        echo "   Повторите пароль для Squid (файл ${SQUID_PASSWD}):"
+        password="$(read_password_twice "$user")" || die "Не удалось прочитать пароль для '$user'."
+        printf '%s:%s\n' "$user" "$password" | chpasswd || die "Не удалось задать системный пароль для '$user'."
         if [[ "$first_htpasswd" == true ]]; then
-            htpasswd -c "$SQUID_PASSWD" "$user" || die "Не удалось создать ${SQUID_PASSWD}."
+            printf '%s\n' "$password" | htpasswd -i -c "$SQUID_PASSWD" "$user" \
+                || die "Не удалось создать ${SQUID_PASSWD}."
             first_htpasswd=false
         else
-            htpasswd "$SQUID_PASSWD" "$user" || die "Не удалось добавить '$user' в ${SQUID_PASSWD}."
+            printf '%s\n' "$password" | htpasswd -i "$SQUID_PASSWD" "$user" \
+                || die "Не удалось добавить '$user' в ${SQUID_PASSWD}."
         fi
+        password=""
     done
 
     detect_proxy_user
     chown "root:${PROXY_USER}" "$SQUID_PASSWD"
     chmod 640 "$SQUID_PASSWD"
+}
+
+assert_ports_still_free() {
+    if port_held_by_foreign_service "$SQUID_PORT"; then
+        die "Порт Squid $SQUID_PORT заняла другая служба. Выберите другой порт."
+    fi
+    if port_held_by_foreign_service "$DANTE_PORT"; then
+        die "Порт Dante $DANTE_PORT заняла другая служба. Выберите другой порт."
+    fi
 }
 
 restart_one() {
@@ -1123,6 +1426,7 @@ collect_settings() {
             echo "IP или CIDR для белого списка через пробел."
             echo "Примеры: 203.0.113.10  198.51.100.0/24  2001:db8::1"
             read -r -e -p "> " WHITELIST_IPS
+            WHITELIST_IPS="$(normalize_ip_list "$WHITELIST_IPS")"
             if [[ "$AUTH_CHOICE" == "3" && -z "$WHITELIST_IPS" ]]; then
                 log_err "Для режима «только белый список» нужен хотя бы один адрес."
                 continue
@@ -1161,11 +1465,12 @@ collect_settings() {
     fi
 
     echo
-    echo "Порты прокси. Не используйте порт SSH (${SSH_PORT})."
+    echo "Порты прокси. Не используйте порт SSH (${SSH_PORTS[*]})."
     while true; do
         read -r -e -i 3128 -p "Порт Squid (HTTP CONNECT) [1-65535]: " SQUID_PORT
         validate_port "$SQUID_PORT" || continue
-        if [[ "$SQUID_PORT" == "$SSH_PORT" ]]; then
+        SQUID_PORT="$(normalize_port "$SQUID_PORT")"
+        if is_ssh_port "$SQUID_PORT"; then
             log_err "Порт $SQUID_PORT занят SSH."
             continue
         fi
@@ -1173,22 +1478,29 @@ collect_settings() {
             log_err "Порт $SQUID_PORT уже слушается другой службой."
             continue
         fi
+        if ((SQUID_PORT < 1024)); then
+            log_warn "Порт $SQUID_PORT меньше 1024 и может пересечься с системной службой."
+        fi
         break
     done
     while true; do
         read -r -e -i 1080 -p "Порт Dante (SOCKS5) [1-65535]: " DANTE_PORT
         validate_port "$DANTE_PORT" || continue
+        DANTE_PORT="$(normalize_port "$DANTE_PORT")"
         if [[ "$DANTE_PORT" == "$SQUID_PORT" ]]; then
             log_err "Порты Squid и Dante должны различаться."
             continue
         fi
-        if [[ "$DANTE_PORT" == "$SSH_PORT" ]]; then
+        if is_ssh_port "$DANTE_PORT"; then
             log_err "Порт $DANTE_PORT занят SSH."
             continue
         fi
         if port_held_by_foreign_service "$DANTE_PORT"; then
             log_err "Порт $DANTE_PORT уже слушается другой службой."
             continue
+        fi
+        if ((DANTE_PORT < 1024)); then
+            log_warn "Порт $DANTE_PORT меньше 1024 и может пересечься с системной службой."
         fi
         break
     done
@@ -1214,10 +1526,18 @@ collect_settings() {
     else
         if systemctl is-active firewalld >/dev/null 2>&1; then
             ENABLE_UFW=false
-        elif ask_yes_no "Включить UFW? SSH-порт ${SSH_PORT} будет разрешён заранее." "y"; then
-            ENABLE_UFW=true
         else
-            ENABLE_UFW=false
+            local ufw_default="n"
+            if command_exists ss && ss -lntupH 2>/dev/null | grep -q sshd; then
+                ufw_default="y"
+            else
+                log_warn "Не видно слушающего sshd. По умолчанию UFW не включается, чтобы не отрезать доступ."
+            fi
+            if ask_yes_no "Включить UFW? SSH (${SSH_PORTS[*]}) будет разрешён заранее." "$ufw_default"; then
+                ENABLE_UFW=true
+            else
+                ENABLE_UFW=false
+            fi
         fi
     fi
 }
@@ -1303,6 +1623,75 @@ selftest() {
         expect_ok validate_ip_or_cidr 2001:db8::/32
     fi
 
+    [[ "$(normalize_port 03128)" == "3128" ]] || { echo "normalize_port failed"; rc=1; }
+    [[ "$(normalize_ip_list '203.0.113.1, 198.51.100.0/24;')" == "203.0.113.1 198.51.100.0/24" ]] \
+        || { echo "normalize_ip_list failed: [$(normalize_ip_list '203.0.113.1, 198.51.100.0/24;')]"; rc=1; }
+
+    local render_dir old_squid old_dante old_log
+    render_dir="$(mktemp -d)"
+    old_squid="$SQUID_CONF"
+    old_dante="$DANTE_CONF"
+    old_log="$DANTE_LOG"
+    SQUID_CONF="${render_dir}/squid.conf"
+    DANTE_CONF="${render_dir}/danted.conf"
+    DANTE_LOG="${render_dir}/danted.log"
+    AUTH_CHOICE=1
+    AUTH_MODE_TEXT="hybrid"
+    WHITELIST_IPS="203.0.113.10 2001:db8::5"
+    SQUID_PORT=3128
+    DANTE_PORT=1080
+    EXTERNAL_IPV4="127.0.0.1"
+    EXTERNAL_INTERFACE="lo"
+    SERVER_IP="203.0.113.2"
+    SQUID_HELPER="/usr/lib/squid/basic_ncsa_auth"
+    DANTE_NOPRIV_USER="nobody"
+    IPV6_ENABLED=true
+    INSTALL_UNBOUND=false
+    write_squid_conf
+    write_dante_conf || { echo "write_dante_conf failed"; rc=1; }
+    grep -q 'user.unprivileged: nobody' "$DANTE_CONF" || { echo "dante user keyword missing"; rc=1; }
+    grep -q 'socksmethod: username' "$DANTE_CONF" || { echo "dante socksmethod missing"; rc=1; }
+    grep -q 'from: 2001:db8::5/128 to: ::/0' "$DANTE_CONF" || { echo "dante ipv6 rule missing"; rc=1; }
+    grep -q 'http_port \[::\]:3128' "$SQUID_CONF" || { echo "squid ipv6 port missing"; rc=1; }
+    grep -q 'acl to_self dst 203.0.113.2' "$SQUID_CONF" || { echo "squid to_self missing"; rc=1; }
+    grep -q 'logformat proxyinstaller' "$SQUID_CONF" || { echo "squid logformat missing"; rc=1; }
+    if grep -q 'acl localhost' "$SQUID_CONF"; then
+        echo "squid redefined built-in localhost ACL"
+        rc=1
+    fi
+    if grep -q '^resolve ' "$DANTE_CONF"; then
+        echo "dante still has invalid resolve block"
+        rc=1
+    fi
+    if command_exists squid; then
+        squid -k parse -f "$SQUID_CONF" >/dev/null 2>&1 || { echo "squid -k parse failed"; squid -k parse -f "$SQUID_CONF" || true; rc=1; }
+    fi
+    if command_exists danted; then
+        danted -f "$DANTE_CONF" -V >/dev/null 2>&1 || { echo "danted -V failed"; danted -f "$DANTE_CONF" -V || true; rc=1; }
+    fi
+    if command_exists fail2ban-regex; then
+        local filter_file dante_line squid_line
+        filter_file="${render_dir}/dante-filter.conf"
+        cat > "$filter_file" <<'EOF'
+[Definition]
+failregex = info: block\(\d+\): tcp/accept \]: <HOST>\.\d+
+ignoreregex =
+EOF
+        dante_line='Oct 23 22:06:46 (1792793206.163861) danted[1]: info: block(1): tcp/accept ]: 203.0.113.50.47538 203.0.113.2.11080: error after reading 4 bytes'
+        fail2ban-regex "$dante_line" "$filter_file" 2>/dev/null | grep -q '1 matched' || { echo "dante fail2ban regex missed"; rc=1; }
+        cat > "${render_dir}/squid-filter.conf" <<'EOF'
+[Definition]
+failregex = ^\s*<HOST> [A-Z_]+_DENIED/\d+
+ignoreregex =
+EOF
+        squid_line='23/Oct/2026:22:05:51 +0000 203.0.113.9 TCP_DENIED/407 CONNECT example.com:443 -'
+        fail2ban-regex "$squid_line" "${render_dir}/squid-filter.conf" 2>/dev/null | grep -q '1 matched' || { echo "squid fail2ban regex missed"; rc=1; }
+    fi
+    SQUID_CONF="$old_squid"
+    DANTE_CONF="$old_dante"
+    DANTE_LOG="$old_log"
+    rm -rf "$render_dir"
+
     if ((rc == 0)); then
         echo "All self-tests passed."
     else
@@ -1343,10 +1732,17 @@ main() {
     is_tty || die "Нужен интерактивный терминал. Скачайте скрипт и запустите: sudo ./proxy-installer.sh"
 
     detect_os
-    detect_ssh_port
+    detect_nologin
     check_internet
     check_disk
-    detect_nologin
+    ensure_iproute
+    detect_ssh_port
+    if ipv6_is_enabled; then
+        IPV6_ENABLED=true
+        log_info "IPv6 включён: Squid и Dante будут слушать его тоже."
+    else
+        IPV6_ENABLED=false
+    fi
 
     maybe_cleanup_previous
     mkdir -p "$STATE_DIR"
@@ -1357,16 +1753,13 @@ main() {
     sleep 1
 
     install_packages
+    assert_ports_still_free
     apply_sysctl
     create_or_update_users
     configure_unbound
     configure_squid
     configure_dante
     configure_fail2ban
-
-    state_set SQUID_PORT "$SQUID_PORT"
-    state_set DANTE_PORT "$DANTE_PORT"
-    state_set AUTH_CHOICE "$AUTH_CHOICE"
 
     restart_services
     print_summary
