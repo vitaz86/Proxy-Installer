@@ -869,7 +869,7 @@ request_header_access From deny all
 request_header_access Server deny all
 request_header_access Link deny all
 
-logformat proxyinstaller %tl %>a %Ss/%03>Hs %rm %ru %un
+logformat proxyinstaller %{%Y-%m-%dT%H:%M:%S}tl %>a %Ss/%03>Hs %rm %ru %un
 access_log stdio:/var/log/squid/access.log proxyinstaller
 
 refresh_pattern ^ftp:           1440    20%     10080
@@ -1073,6 +1073,10 @@ configure_fail2ban() {
     backup_file "$FAIL2BAN_FILTER"
 
     local ignore="127.0.0.1/8 ::1"
+    local ssh_ports="ssh"
+    if ((${#SSH_PORTS[@]} > 0)); then
+        ssh_ports="$(IFS=,; echo "${SSH_PORTS[*]}")"
+    fi
     if [[ -n "$WHITELIST_IPS" ]]; then
         ignore="${ignore} ${WHITELIST_IPS}"
     fi
@@ -1087,13 +1091,23 @@ EOF
 
     cat > "$FAIL2BAN_SQUID_FILTER" <<'EOF'
 [Definition]
-# logformat proxyinstaller %tl %>a %Ss/%03>Hs %rm %ru %un
+# logformat proxyinstaller %{%Y-%m-%dT%H:%M:%S}tl %>a %Ss/%03>Hs %rm %ru %un
+# Numeric timestamp, so a non-English locale cannot hide the line from Fail2ban.
 failregex = ^\s*<HOST> [A-Z_]+_DENIED/\d+
 ignoreregex =
 EOF
 
     mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d
     cat > "$FAIL2BAN_JAIL" <<EOF
+# SSH is already enabled by Debian/Ubuntu's defaults-debian.conf, but that
+# jail bans the "ssh" service port (22). Repeat it here with the detected ports.
+[sshd]
+enabled = true
+port = ${ssh_ports}
+maxretry = 5
+findtime = 10m
+bantime = 1h
+
 [squid-proxy-installer]
 enabled = true
 filter = squid-proxy-installer
@@ -1109,6 +1123,7 @@ ignoreip = ${ignore}
 enabled = true
 filter = dante-proxy-installer
 port = ${DANTE_PORT}
+protocol = tcp
 logpath = ${DANTE_LOG}
 backend = polling
 bantime = 2h
@@ -1691,7 +1706,7 @@ selftest() {
     grep -q 'from: 2001:db8::5/128 to: ::/0' "$DANTE_CONF" || { echo "dante ipv6 rule missing"; rc=1; }
     grep -q 'http_port \[::\]:3128' "$SQUID_CONF" || { echo "squid ipv6 port missing"; rc=1; }
     grep -q 'acl to_self dst 203.0.113.2' "$SQUID_CONF" || { echo "squid to_self missing"; rc=1; }
-    grep -q 'logformat proxyinstaller' "$SQUID_CONF" || { echo "squid logformat missing"; rc=1; }
+    grep -q 'logformat proxyinstaller %{%Y-%m-%dT%H:%M:%S}tl' "$SQUID_CONF" || { echo "squid logformat missing"; rc=1; }
     if grep -q 'acl localhost' "$SQUID_CONF"; then
         echo "squid redefined built-in localhost ACL"
         rc=1
@@ -1721,7 +1736,7 @@ EOF
 failregex = ^\s*<HOST> [A-Z_]+_DENIED/\d+
 ignoreregex =
 EOF
-        squid_line='23/Oct/2026:22:05:51 +0000 203.0.113.9 TCP_DENIED/407 CONNECT example.com:443 -'
+        squid_line='2026-10-25T17:34:01+0000 203.0.113.9 TCP_DENIED/407 CONNECT example.com:443 -'
         fail2ban-regex "$squid_line" "${render_dir}/squid-filter.conf" 2>/dev/null | grep -q '1 matched' || { echo "squid fail2ban regex missed"; rc=1; }
     fi
     SQUID_CONF="$old_squid"
