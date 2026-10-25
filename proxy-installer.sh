@@ -799,6 +799,9 @@ auth_param basic program ${helper} ${SQUID_PASSWD}
 auth_param basic children 5
 auth_param basic realm Squid Proxy
 auth_param basic credentialsttl 2 hours
+# Default casesensitive is off: Squid lowercases the username before
+# basic_ncsa_auth. /etc/squid/passwd keeps the original name and a
+# lowercase alias with the same password hash.
 acl authenticated proxy_auth REQUIRED
 EOF
 )
@@ -1261,6 +1264,22 @@ retire_stale_proxy_users() {
     done
 }
 
+add_squid_case_alias() {
+    # Squid lowercases Basic usernames before the helper. Keep the original
+    # htpasswd entry (and the system account used by Dante) and add a
+    # lowercase alias with the same hash, e.g. RuProxySitc and ruproxysitc.
+    local user="$1" lower="${1,,}" hash tmp
+    [[ "$lower" == "$user" ]] && return 0
+    [[ -f "$SQUID_PASSWD" ]] || return 1
+    hash="$(awk -F: -v u="$user" '$1 == u { sub(/^[^:]*:/, ""); print; exit }' "$SQUID_PASSWD")"
+    [[ -n "$hash" ]] || return 1
+    tmp="$(mktemp)"
+    awk -F: -v u="$lower" '$1 != u' "$SQUID_PASSWD" > "$tmp"
+    printf '%s:%s\n' "$lower" "$hash" >> "$tmp"
+    mv "$tmp" "$SQUID_PASSWD"
+    log_info "Squid получит логин '$lower'. Исходное имя '$user' и его пароль сохранены."
+}
+
 create_or_update_users() {
     retire_stale_proxy_users
     if [[ "$AUTH_CHOICE" == "3" ]]; then
@@ -1298,6 +1317,7 @@ create_or_update_users() {
             printf '%s\n' "$password" | htpasswd -i "$SQUID_PASSWD" "$user" \
                 || die "Не удалось добавить '$user' в ${SQUID_PASSWD}."
         fi
+        add_squid_case_alias "$user" || die "Не удалось добавить строчный алиас Squid для '$user'."
         password=""
     done
 
@@ -1455,11 +1475,14 @@ collect_settings() {
             validate_username "$username" || continue
             local dup
             for dup in "${USERS[@]}"; do
-                if [[ "$dup" == "$username" ]]; then
-                    log_err "Пользователь '$username' уже добавлен."
+                if [[ "${dup,,}" == "${username,,}" ]]; then
+                    log_err "Имя '$username' совпадает с '$dup' без учёта регистра. Squid ищет логин в нижнем регистре."
                     continue 2
                 fi
             done
+            if [[ "$username" != "${username,,}" ]]; then
+                log_info "Для Squid будет добавлен алиас '${username,,}'. Для Dante останется '$username'."
+            fi
             USERS+=("$username")
         done
     fi
@@ -1626,6 +1649,20 @@ selftest() {
     [[ "$(normalize_port 03128)" == "3128" ]] || { echo "normalize_port failed"; rc=1; }
     [[ "$(normalize_ip_list '203.0.113.1, 198.51.100.0/24;')" == "203.0.113.1 198.51.100.0/24" ]] \
         || { echo "normalize_ip_list failed: [$(normalize_ip_list '203.0.113.1, 198.51.100.0/24;')]"; rc=1; }
+
+    local old_passwd passwd_file
+    old_passwd="$SQUID_PASSWD"
+    passwd_file="$(mktemp)"
+    SQUID_PASSWD="$passwd_file"
+    printf '%s\n' 'RuProxySitc:apr1-salt-hash' > "$SQUID_PASSWD"
+    add_squid_case_alias RuProxySitc || { echo "case alias failed"; rc=1; }
+    grep -qxF 'RuProxySitc:apr1-salt-hash' "$SQUID_PASSWD" || { echo "original htpasswd entry missing"; rc=1; }
+    grep -qxF 'ruproxysitc:apr1-salt-hash' "$SQUID_PASSWD" || { echo "lowercase htpasswd alias missing"; rc=1; }
+    printf '%s\n' 'alice:apr1-x' > "$SQUID_PASSWD"
+    add_squid_case_alias alice || { echo "lowercase alias no-op failed"; rc=1; }
+    [[ "$(grep -c . "$SQUID_PASSWD")" -eq 1 ]] || { echo "lowercase user should not gain an alias"; rc=1; }
+    SQUID_PASSWD="$old_passwd"
+    rm -f "$passwd_file"
 
     local render_dir old_squid old_dante old_log
     render_dir="$(mktemp -d)"
