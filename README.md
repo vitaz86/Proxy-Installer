@@ -60,7 +60,7 @@ bash proxy-installer.sh --selftest
 Follow the prompts to:
 - Choose the authentication mode (hybrid, password only, or IP whitelist only)
 - Add whitelist addresses (IPv4, IPv6, or CIDR such as `192.168.1.0/24`)
-- Create users and set passwords (Dante uses the system password; Squid uses `/etc/squid/passwd`)
+- Create users and set one password for both Dante and Squid (at least 8 characters). Mixed-case names are kept for Dante; Squid also gets a lowercase password-file alias because it lowercases Basic usernames before authentication.
 - Select ports for Squid and Dante
 - Optionally install Unbound and apply network optimizations
 - Optionally enable UFW (SSH is allowed before UFW is turned on)
