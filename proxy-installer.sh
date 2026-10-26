@@ -1068,6 +1068,27 @@ EOF
     log_ok "Dante: интерфейс ${EXTERNAL_INTERFACE}, адрес ${EXTERNAL_IPV4:-auto}, порт ${DANTE_PORT}."
 }
 
+write_fail2ban_filters() {
+    cat > "$FAIL2BAN_FILTER" <<'EOF'
+[Definition]
+# Dante 1.4.3 file log:
+# Oct 23 22:06:46 (epoch) danted[pid]: info: block(1): tcp/accept ]: 203.0.113.5.54321 ...
+failregex = info: block\(\d+\): tcp/accept \]: <HOST>\.\d+
+ignoreregex =
+EOF
+
+    cat > "$FAIL2BAN_SQUID_FILTER" <<'EOF'
+[Definition]
+# logformat proxyinstaller %{%Y-%m-%dT%H:%M:%S}tl %>a %Ss/%03>Hs %rm %ru %un
+# Example: 2026-10-25T17:34:01 203.0.113.9 TCP_DENIED/407 CONNECT example.com:443 -
+# The timestamp is optional in the regex because Fail2ban removes a recognized
+# date before matching, and required when that removal does not happen.
+failregex = ^(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\s+)?\s*<HOST> [A-Z_]+_DENIED/\d+
+datepattern = {^LN-BEG}ExYear-Month-DayT24hour:Minute:Second
+ignoreregex =
+EOF
+}
+
 configure_fail2ban() {
     backup_file "$FAIL2BAN_JAIL"
     backup_file "$FAIL2BAN_FILTER"
@@ -1081,23 +1102,8 @@ configure_fail2ban() {
         ignore="${ignore} ${WHITELIST_IPS}"
     fi
 
-    cat > "$FAIL2BAN_FILTER" <<'EOF'
-[Definition]
-# Dante 1.4.3 file log:
-# Oct 23 22:06:46 (epoch) danted[pid]: info: block(1): tcp/accept ]: 203.0.113.5.54321 ...
-failregex = info: block\(\d+\): tcp/accept \]: <HOST>\.\d+
-ignoreregex =
-EOF
-
-    cat > "$FAIL2BAN_SQUID_FILTER" <<'EOF'
-[Definition]
-# logformat proxyinstaller %{%Y-%m-%dT%H:%M:%S}tl %>a %Ss/%03>Hs %rm %ru %un
-# Numeric timestamp, so a non-English locale cannot hide the line from Fail2ban.
-failregex = ^\s*<HOST> [A-Z_]+_DENIED/\d+
-ignoreregex =
-EOF
-
     mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d
+    write_fail2ban_filters
     cat > "$FAIL2BAN_JAIL" <<EOF
 # SSH is already enabled by Debian/Ubuntu's defaults-debian.conf, but that
 # jail bans the "ssh" service port (22). Repeat it here with the detected ports.
@@ -1722,22 +1728,24 @@ selftest() {
         danted -f "$DANTE_CONF" -V >/dev/null 2>&1 || { echo "danted -V failed"; danted -f "$DANTE_CONF" -V || true; rc=1; }
     fi
     if command_exists fail2ban-regex; then
-        local filter_file dante_line squid_line
-        filter_file="${render_dir}/dante-filter.conf"
-        cat > "$filter_file" <<'EOF'
-[Definition]
-failregex = info: block\(\d+\): tcp/accept \]: <HOST>\.\d+
-ignoreregex =
-EOF
+        local old_dante_filter old_squid_filter dante_line squid_line
+        old_dante_filter="$FAIL2BAN_FILTER"
+        old_squid_filter="$FAIL2BAN_SQUID_FILTER"
+        FAIL2BAN_FILTER="${render_dir}/dante-proxy-installer.conf"
+        FAIL2BAN_SQUID_FILTER="${render_dir}/squid-proxy-installer.conf"
+        write_fail2ban_filters
         dante_line='Oct 23 22:06:46 (1792793206.163861) danted[1]: info: block(1): tcp/accept ]: 203.0.113.50.47538 203.0.113.2.11080: error after reading 4 bytes'
-        fail2ban-regex "$dante_line" "$filter_file" 2>/dev/null | grep -q '1 matched' || { echo "dante fail2ban regex missed"; rc=1; }
-        cat > "${render_dir}/squid-filter.conf" <<'EOF'
-[Definition]
-failregex = ^\s*<HOST> [A-Z_]+_DENIED/\d+
-ignoreregex =
-EOF
-        squid_line='2026-10-25T17:34:01+0000 203.0.113.9 TCP_DENIED/407 CONNECT example.com:443 -'
-        fail2ban-regex "$squid_line" "${render_dir}/squid-filter.conf" 2>/dev/null | grep -q '1 matched' || { echo "squid fail2ban regex missed"; rc=1; }
+        fail2ban-regex "$dante_line" "$FAIL2BAN_FILTER" 2>/dev/null | grep -q '1 matched' || { echo "dante fail2ban regex missed"; rc=1; }
+        # Same line Squid writes for logformat %{%Y-%m-%dT%H:%M:%S}tl %>a %Ss/%03>Hs
+        squid_line='2026-10-25T17:34:01 203.0.113.9 TCP_DENIED/407 CONNECT example.com:443 -'
+        fail2ban-regex "$squid_line" "$FAIL2BAN_SQUID_FILTER" 2>/dev/null | grep -q '1 matched' || { echo "squid fail2ban regex missed"; rc=1; }
+        squid_line='2026-10-25T17:34:01 198.51.100.8 TCP_TUNNEL/200 CONNECT example.com:443 alice'
+        if fail2ban-regex "$squid_line" "$FAIL2BAN_SQUID_FILTER" 2>/dev/null | grep -q '1 matched'; then
+            echo "squid fail2ban regex matched a successful request"
+            rc=1
+        fi
+        FAIL2BAN_FILTER="$old_dante_filter"
+        FAIL2BAN_SQUID_FILTER="$old_squid_filter"
     fi
     SQUID_CONF="$old_squid"
     DANTE_CONF="$old_dante"
