@@ -39,6 +39,8 @@ SQUID_PASSWD="/etc/squid/passwd"
 SQUID_CONF="/etc/squid/squid.conf"
 DANTE_CONF="/etc/danted.conf"
 DANTE_LOG="/var/log/danted.log"
+DANTE_APT_LIST="/etc/apt/sources.list.d/proxy-installer-dante.list"
+DANTE_APT_PIN="/etc/apt/preferences.d/proxy-installer-dante"
 
 INSTALL_UNBOUND=false
 APPLY_OPTIMIZATIONS=false
@@ -653,6 +655,7 @@ cleanup() {
     done
 
     rm -f "$SQUID_PASSWD" "$SYSCTL_FILE" "$LOGROTATE_FILE" "$DANTE_LOG"
+    rm -f "$DANTE_APT_LIST" "$DANTE_APT_PIN"
     rm -rf "$STATE_DIR"
     log_ok "Очистка завершена."
     sleep 1
@@ -664,8 +667,108 @@ cleanup() {
 
 apt_install() {
     apt-get update -qq -o Acquire::Retries=3 || die "Не удалось обновить списки пакетов (apt-get update)."
+    local pkg
+    for pkg in "$@"; do
+        if [[ "$pkg" == "dante-server" ]]; then
+            ensure_dante_repository
+            break
+        fi
+    done
     apt-get install -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" "$@" \
         || die "Не удалось установить пакеты: $*"
+}
+
+package_available() {
+    apt-cache show "$1" 2>/dev/null | grep -q '^Package:'
+}
+
+dante_fallback_suite() {
+    # Debian 13 (trixie) does not ship dante-server. Bookworm's build runs there.
+    # riscv64 was not built for bookworm, so use the forky package for that arch.
+    case "$1" in
+        amd64|arm64|armel|armhf|i386|mips64el|mipsel|ppc64el|s390x) echo bookworm ;;
+        riscv64) echo forky ;;
+        *) return 1 ;;
+    esac
+}
+
+debian_archive_uri() {
+    local uri=""
+    uri="$(awk '
+        /^URIs:/ {u=$2}
+        /^Suites:/ && $2 !~ /security/ && u != "" {print u; exit}
+    ' /etc/apt/sources.list.d/*.sources 2>/dev/null || true)"
+    if [[ -z "$uri" && -f /etc/apt/sources.list ]]; then
+        uri="$(awk '/^deb / && $0 !~ /security/ {print $2; exit}' /etc/apt/sources.list)"
+    fi
+    printf '%s\n' "${uri:-http://deb.debian.org/debian}"
+}
+
+debian_archive_keyring() {
+    local key
+    for key in \
+        /usr/share/keyrings/debian-archive-keyring.gpg \
+        /usr/share/keyrings/debian-archive-keyring.pgp \
+        /etc/apt/trusted.gpg.d/debian-archive-keyring.gpg
+    do
+        if [[ -f "$key" ]]; then
+            printf '%s\n' "$key"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ensure_dante_repository() {
+    package_available dante-server && return 0
+
+    case "$OS_ID" in
+        ubuntu|linuxmint|pop|elementary|zorin|neon|kubuntu|xubuntu|lubuntu)
+            die "Пакет dante-server не найден. Включите репозиторий universe: add-apt-repository universe"
+            ;;
+    esac
+
+    local arch suite uri keyring
+    arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+    suite="$(dante_fallback_suite "$arch")" || die "Пакет dante-server отсутствует в этой системе, и для архитектуры ${arch} нет запасной сборки Debian."
+    uri="$(debian_archive_uri)"
+    if ! keyring="$(debian_archive_keyring)"; then
+        apt-get install -y -qq debian-archive-keyring || die "Не удалось установить ключи архива Debian."
+        keyring="$(debian_archive_keyring)" || die "Не найден ключ архива Debian."
+    fi
+
+    log_warn "В репозитории ${OS_ID} ${OS_VERSION_ID} нет dante-server (Debian 13 его не включает)."
+    log_warn "Подключаю только этот пакет из Debian ${suite}. Остальные пакеты из ${suite} запрещены."
+
+    mkdir -p /etc/apt/sources.list.d /etc/apt/preferences.d
+    write_dante_source() {
+        printf 'deb [signed-by=%s] %s %s main\n' "$keyring" "$1" "$suite" > "$DANTE_APT_LIST"
+    }
+    cat > "$DANTE_APT_PIN" <<EOF
+Package: dante-server
+Pin: release n=${suite}
+Pin-Priority: 990
+
+Package: *
+Pin: release n=${suite}
+Pin-Priority: -1
+EOF
+    write_dante_source "$uri"
+    if ! apt-get update -qq -o Acquire::Retries=3; then
+        if [[ "$uri" != "http://deb.debian.org/debian" && "$uri" != "https://deb.debian.org/debian" ]]; then
+            log_warn "Зеркало не отдаёт Debian ${suite}. Пробую deb.debian.org."
+            write_dante_source "http://deb.debian.org/debian"
+            if ! apt-get update -qq -o Acquire::Retries=3; then
+                rm -f "$DANTE_APT_LIST" "$DANTE_APT_PIN"
+                apt-get update -qq -o Acquire::Retries=3 || true
+                die "Не удалось подключить Debian ${suite} для установки dante-server."
+            fi
+        else
+            rm -f "$DANTE_APT_LIST" "$DANTE_APT_PIN"
+            die "Не удалось обновить списки после подключения Debian ${suite}."
+        fi
+    fi
+    package_available dante-server || die "dante-server не найден даже в Debian ${suite}."
 }
 
 install_packages() {
@@ -1668,6 +1771,12 @@ selftest() {
     fi
 
     [[ "$(normalize_port 03128)" == "3128" ]] || { echo "normalize_port failed"; rc=1; }
+    [[ "$(dante_fallback_suite amd64)" == "bookworm" ]] || { echo "dante suite amd64 failed"; rc=1; }
+    [[ "$(dante_fallback_suite riscv64)" == "forky" ]] || { echo "dante suite riscv64 failed"; rc=1; }
+    if dante_fallback_suite s390 >/dev/null; then
+        echo "dante suite s390 should fail"
+        rc=1
+    fi
     [[ "$(normalize_ip_list '203.0.113.1, 198.51.100.0/24;')" == "203.0.113.1 198.51.100.0/24" ]] \
         || { echo "normalize_ip_list failed: [$(normalize_ip_list '203.0.113.1, 198.51.100.0/24;')]"; rc=1; }
 
