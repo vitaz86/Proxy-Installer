@@ -685,11 +685,11 @@ package_available() {
 }
 
 dante_fallback_suite() {
-    # Debian 13 (trixie) does not ship dante-server. Bookworm's build runs there.
-    # riscv64 was not built for bookworm, so use the forky package for that arch.
+    # Debian 13 has no dante-server. Bookworm's 1.4.2 is vulnerable to
+    # CVE-2024-54662; the fix is 1.4.4, which forky ships. Architectures
+    # without that build are refused instead of falling back to 1.4.2.
     case "$1" in
-        amd64|arm64|armel|armhf|i386|mips64el|mipsel|ppc64el|s390x) echo bookworm ;;
-        riscv64) echo forky ;;
+        amd64|arm64|i386|ppc64el|riscv64|s390x) echo forky ;;
         *) return 1 ;;
     esac
 }
@@ -722,7 +722,20 @@ debian_archive_keyring() {
 }
 
 ensure_dante_repository() {
-    package_available dante-server && return 0
+    local ver="" major=""
+    if package_available dante-server; then
+        ver="$(apt-cache show dante-server | awk '/^Version:/ {print $2; exit}')"
+        major="${OS_VERSION_ID%%.*}"
+        if dpkg --compare-versions "$ver" ge 1.4.4; then
+            return 0
+        fi
+        # Debian 12 cannot run the 1.4.4 build (it needs glibc 2.38).
+        # Debian 13 can, so a cached 1.4.2 must not be kept.
+        if [[ "$OS_ID" != "debian" ]] || ! [[ "$major" =~ ^[0-9]+$ ]] || ((major < 13)); then
+            return 0
+        fi
+        log_warn "Доступен dante-server ${ver}. Он уязвим (CVE-2024-54662). Ставлю 1.4.4."
+    fi
 
     case "$OS_ID" in
         ubuntu|linuxmint|pop|elementary|zorin|neon|kubuntu|xubuntu|lubuntu)
@@ -732,7 +745,7 @@ ensure_dante_repository() {
 
     local arch suite uri keyring
     arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
-    suite="$(dante_fallback_suite "$arch")" || die "Пакет dante-server отсутствует в этой системе, и для архитектуры ${arch} нет запасной сборки Debian."
+    suite="$(dante_fallback_suite "$arch")" || die "Пакет dante-server отсутствует, а для архитектуры ${arch} нет сборки 1.4.4. Версию 1.4.2 из Debian 12 ставить нельзя: она уязвима (CVE-2024-54662)."
     uri="$(debian_archive_uri)"
     if ! keyring="$(debian_archive_keyring)"; then
         apt-get install -y -qq debian-archive-keyring || die "Не удалось установить ключи архива Debian."
@@ -740,7 +753,7 @@ ensure_dante_repository() {
     fi
 
     log_warn "В репозитории ${OS_ID} ${OS_VERSION_ID} нет dante-server (Debian 13 его не включает)."
-    log_warn "Подключаю только этот пакет из Debian ${suite}. Остальные пакеты из ${suite} запрещены."
+    log_warn "Подключаю только dante-server 1.4.4 из Debian ${suite} (CVE-2024-54662 исправлен). Остальные пакеты из ${suite} запрещены."
 
     mkdir -p /etc/apt/sources.list.d /etc/apt/preferences.d
     write_dante_source() {
@@ -770,7 +783,11 @@ EOF
             die "Не удалось обновить списки после подключения Debian ${suite}."
         fi
     fi
-    package_available dante-server || die "dante-server не найден даже в Debian ${suite}."
+    ver="$(apt-cache show dante-server | awk '/^Version:/ {print $2; exit}')"
+    if ! dpkg --compare-versions "$ver" ge 1.4.4; then
+        rm -f "$DANTE_APT_LIST" "$DANTE_APT_PIN"
+        die "В Debian ${suite} найден dante-server ${ver:-неизвестной версии}. Нужна версия 1.4.4 или новее (CVE-2024-54662)."
+    fi
 }
 
 install_packages() {
@@ -1775,10 +1792,10 @@ selftest() {
     fi
 
     [[ "$(normalize_port 03128)" == "3128" ]] || { echo "normalize_port failed"; rc=1; }
-    [[ "$(dante_fallback_suite amd64)" == "bookworm" ]] || { echo "dante suite amd64 failed"; rc=1; }
+    [[ "$(dante_fallback_suite amd64)" == "forky" ]] || { echo "dante suite amd64 failed"; rc=1; }
     [[ "$(dante_fallback_suite riscv64)" == "forky" ]] || { echo "dante suite riscv64 failed"; rc=1; }
-    if dante_fallback_suite s390 >/dev/null; then
-        echo "dante suite s390 should fail"
+    if dante_fallback_suite armhf >/dev/null; then
+        echo "dante suite armhf should fail"
         rc=1
     fi
     [[ "$(normalize_ip_list '203.0.113.1, 198.51.100.0/24;')" == "203.0.113.1 198.51.100.0/24" ]] \

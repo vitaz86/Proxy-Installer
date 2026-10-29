@@ -3,7 +3,7 @@
 An interactive Bash script for installing and configuring a forward HTTP/HTTPS proxy (Squid, CONNECT method) and a SOCKS5 proxy (Dante) with password and/or IP-whitelist access on Debian and Ubuntu.
 
 ## Features
-- Debian 11+ / Ubuntu 20.04+ and derivatives (Linux Mint, Pop!_OS, and other apt-based systems). Debian 13 does not ship Dante; the installer adds only `dante-server` from Debian 12.
+- Debian 11+ / Ubuntu 20.04+ and derivatives (Linux Mint, Pop!_OS, and other apt-based systems). Debian 13 does not ship Dante; the installer adds only `dante-server` 1.4.4 from Debian testing (forky). The Debian 12 package is not used because it is vulnerable to CVE-2024-54662.
 - Installs Squid (HTTP CONNECT) and Dante (SOCKS5) with Fail2ban protection
 - Optional Unbound DNS resolver bound to **127.0.0.1 only** (used by Squid, not exposed to the internet)
 - Optional BBR/sysctl tuning via `/etc/sysctl.d/` (no duplicate lines in `sysctl.conf`; skipped if the kernel cannot apply it)

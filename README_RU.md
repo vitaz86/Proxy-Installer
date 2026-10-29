@@ -3,7 +3,7 @@
 Интерактивный Bash-скрипт для установки и настройки прямого HTTP/HTTPS-прокси (Squid, метод CONNECT) и SOCKS5-прокси (Dante) с доступом по паролю и/или белому списку IP на Debian и Ubuntu.
 
 ## Возможности
-- Debian 11+ / Ubuntu 20.04+ и производные (Linux Mint, Pop!_OS и другие системы с apt). В Debian 13 нет Dante: установщик подключает только пакет `dante-server` из Debian 12.
+- Debian 11+ / Ubuntu 20.04+ и производные (Linux Mint, Pop!_OS и другие системы с apt). В Debian 13 нет Dante: установщик подключает только `dante-server` 1.4.4 из Debian testing (forky). Пакет из Debian 12 не используется: он уязвим (CVE-2024-54662).
 - Устанавливает Squid (HTTP CONNECT) и Dante (SOCKS5) с защитой Fail2ban
 - Опциональный Unbound DNS **только на 127.0.0.1** (для Squid, без публикации резолвера в интернет)
 - Опциональный тюнинг BBR/sysctl через `/etc/sysctl.d/` (без дублирования строк в `sysctl.conf`; пропускается, если ядро не поддерживает)
