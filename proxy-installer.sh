@@ -3,7 +3,7 @@
 #   Advanced Proxy Installer by vitaz86
 #   Interactive installer for Squid (HTTP/HTTPS forward proxy) and
 #   Dante (SOCKS5) with optional IP whitelist, Fail2ban and Unbound.
-#   Debian 13+ / Ubuntu 20.04+ and derivatives (Mint, Pop!_OS, etc.).
+#   Debian 13+ / Ubuntu 24.04+ and derivatives (Mint, Pop!_OS, etc.).
 # ====================================================================
 
 if [[ -z "${BASH_VERSION:-}" ]] || ((BASH_VERSINFO[0] < 4)); then
@@ -93,7 +93,7 @@ print_banner() {
     echo -e "${C_BLUE}=======================================================${C_RESET}"
     echo
     echo "Установка Squid (HTTP/HTTPS CONNECT) и Dante (SOCKS5)"
-    echo "на Debian 13+ и Ubuntu 20.04+."
+    echo "на Debian 13+ и Ubuntu 24.04+."
     echo "Fail2ban, опциональный Unbound и настройка firewall."
     echo
 }
@@ -323,8 +323,8 @@ detect_os() {
     case "$OS_ID" in
         ubuntu)
             local major="${OS_VERSION_ID%%.*}"
-            if [[ "$major" =~ ^[0-9]+$ ]] && ((major < 20)); then
-                die "Нужен Ubuntu 20.04 или новее (сейчас ${OS_VERSION_ID})."
+            if [[ "$major" =~ ^[0-9]+$ ]] && ((major < 24)); then
+                die "Нужен Ubuntu 24.04 или новее (сейчас ${OS_VERSION_ID}). В Ubuntu 20.04 и 22.04 пакет dante-server старше 1.4.4 и уязвим (CVE-2024-54662), а исправленная сборка требует glibc 2.38."
             fi
             ;;
         debian|raspbian|devuan)
@@ -336,10 +336,10 @@ detect_os() {
     esac
 
     # Derivatives (Mint, Zorin, elementary, Pop!_OS) use their own VERSION_ID.
-    # Reject them only when the Ubuntu base is older than 20.04.
+    # focal and jammy are too old to run Dante 1.4.4.
     case "${UBUNTU_CODENAME:-}" in
-        precise|trusty|xenial|bionic)
-            die "База Ubuntu слишком старая (${UBUNTU_CODENAME}). Нужен Ubuntu 20.04 (focal) или новее."
+        precise|trusty|xenial|bionic|focal|jammy)
+            die "База Ubuntu слишком старая (${UBUNTU_CODENAME}). Нужен Ubuntu 24.04 (noble) или новее: более старый Dante уязвим (CVE-2024-54662)."
             ;;
     esac
 
@@ -693,14 +693,22 @@ dante_fallback_suite() {
     esac
 }
 
-# accept: the candidate is safe to install as-is
-# replace: Debian 13+ has only an older build; fetch 1.4.4
-# refuse: older Debian cannot run 1.4.4 (needs glibc 2.38)
+# accept: the candidate is already 1.4.4 or newer
+# replace: a fixed 1.4.4 build can run here (glibc 2.38 or newer)
+# refuse: the only build is vulnerable and 1.4.4 cannot be installed
 dante_candidate_action() {
-    local os="$1" version_id="$2" pkgver="$3"
+    local os="$1" version_id="$2" pkgver="$3" glibc="${4:-}"
     local major="${version_id%%.*}"
     if dpkg --compare-versions "$pkgver" ge 1.4.4; then
         echo accept
+        return 0
+    fi
+    if [[ -n "$glibc" ]]; then
+        if dpkg --compare-versions "$glibc" ge 2.38; then
+            echo replace
+        else
+            echo refuse
+        fi
         return 0
     fi
     case "$os" in
@@ -711,8 +719,27 @@ dante_candidate_action() {
                 echo refuse
             fi
             ;;
-        *) echo accept ;;
+        ubuntu|linuxmint|pop|elementary|zorin|neon|kubuntu|xubuntu|lubuntu)
+            # 24.04 and newer have glibc >= 2.39. 20.04 and 22.04 do not.
+            if [[ "$major" =~ ^[0-9]+$ ]] && ((major >= 24)); then
+                echo replace
+            else
+                echo refuse
+            fi
+            ;;
+        *) echo refuse ;;
     esac
+}
+
+glibc_version() {
+    local raw=""
+    raw="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+    if [[ "$raw" =~ ([0-9]+\.[0-9]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    raw="$(ldd --version 2>/dev/null | awk 'NR==1 {print $NF; exit}')"
+    printf '%s\n' "$raw"
 }
 
 debian_archive_uri() {
@@ -747,7 +774,7 @@ ensure_dante_repository() {
     if package_available dante-server; then
         ver="$(apt-cache show dante-server | awk '/^Version:/ {print $2; exit}')"
     fi
-    action="$(dante_candidate_action "$OS_ID" "$OS_VERSION_ID" "${ver:-0}")"
+    action="$(dante_candidate_action "$OS_ID" "$OS_VERSION_ID" "${ver:-0}" "$(glibc_version)")"
     case "$action" in
         accept)
             if [[ -n "$ver" ]]; then
@@ -755,7 +782,7 @@ ensure_dante_repository() {
             fi
             ;;
         refuse)
-            die "dante-server ${ver:-из этого выпуска} уязвим (CVE-2024-54662, исправлено в 1.4.4). На ${OS_ID} ${OS_VERSION_ID} исправленную сборку поставить нельзя: ей нужен glibc 2.38 (Debian 13 или новее). Установка остановлена."
+            die "dante-server ${ver:-из этого выпуска} уязвим (CVE-2024-54662, исправлено в 1.4.4). На этой системе glibc старше 2.38, поэтому исправленную сборку поставить нельзя. Установка остановлена."
             ;;
         replace)
             if [[ -n "$ver" ]]; then
@@ -766,20 +793,25 @@ ensure_dante_repository() {
 
     case "$OS_ID" in
         ubuntu|linuxmint|pop|elementary|zorin|neon|kubuntu|xubuntu|lubuntu)
-            die "Пакет dante-server не найден. Включите репозиторий universe: add-apt-repository universe"
+            if [[ "$action" != "replace" ]]; then
+                die "Пакет dante-server не найден. Включите репозиторий universe: add-apt-repository universe"
+            fi
             ;;
     esac
 
     local arch suite uri keyring
     arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
-    suite="$(dante_fallback_suite "$arch")" || die "Пакет dante-server отсутствует, а для архитектуры ${arch} нет сборки 1.4.4. Версию 1.4.2 из Debian 12 ставить нельзя: она уязвима (CVE-2024-54662)."
-    uri="$(debian_archive_uri)"
+    suite="$(dante_fallback_suite "$arch")" || die "Пакет dante-server отсутствует, а для архитектуры ${arch} нет сборки 1.4.4. Версию старше 1.4.4 ставить нельзя: она уязвима (CVE-2024-54662)."
+    case "$OS_ID" in
+        debian|raspbian|devuan) uri="$(debian_archive_uri)" ;;
+        *) uri="http://deb.debian.org/debian" ;;
+    esac
     if ! keyring="$(debian_archive_keyring)"; then
         apt-get install -y -qq debian-archive-keyring || die "Не удалось установить ключи архива Debian."
         keyring="$(debian_archive_keyring)" || die "Не найден ключ архива Debian."
     fi
 
-    log_warn "В репозитории ${OS_ID} ${OS_VERSION_ID} нет dante-server (Debian 13 его не включает)."
+    log_warn "В репозитории ${OS_ID} ${OS_VERSION_ID} нет dante-server 1.4.4."
     log_warn "Подключаю только dante-server 1.4.4 из Debian ${suite} (CVE-2024-54662 исправлен). Остальные пакеты из ${suite} запрещены."
 
     mkdir -p /etc/apt/sources.list.d /etc/apt/preferences.d
@@ -1823,7 +1855,13 @@ selftest() {
     [[ "$(dante_candidate_action debian 11 1.4.2+dfsg-7+b2)" == "refuse" ]] || { echo "debian 11 must refuse dante 1.4.2"; rc=1; }
     [[ "$(dante_candidate_action debian 13 1.4.2+dfsg-7)" == "replace" ]] || { echo "debian 13 must replace dante 1.4.2"; rc=1; }
     [[ "$(dante_candidate_action debian 13 1.4.4+dfsg2-1+b1)" == "accept" ]] || { echo "debian 13 must accept dante 1.4.4"; rc=1; }
-    [[ "$(dante_candidate_action ubuntu 24.04 1.4.3+dfsg-1)" == "accept" ]] || { echo "ubuntu candidate action failed"; rc=1; }
+    [[ "$(dante_candidate_action ubuntu 20.04 1.4.2+dfsg-7)" == "refuse" ]] || { echo "ubuntu 20.04 must refuse dante 1.4.2"; rc=1; }
+    [[ "$(dante_candidate_action ubuntu 22.04 1.4.3+dfsg-1)" == "refuse" ]] || { echo "ubuntu 22.04 must refuse dante 1.4.3"; rc=1; }
+    [[ "$(dante_candidate_action ubuntu 24.04 1.4.3+dfsg-1)" == "replace" ]] || { echo "ubuntu 24.04 must replace dante 1.4.3"; rc=1; }
+    [[ "$(dante_candidate_action ubuntu 24.04 1.4.3+dfsg-1 2.39)" == "replace" ]] || { echo "ubuntu 24.04 glibc 2.39 must replace"; rc=1; }
+    [[ "$(dante_candidate_action ubuntu 22.04 1.4.3+dfsg-1 2.35)" == "refuse" ]] || { echo "ubuntu 22.04 glibc 2.35 must refuse"; rc=1; }
+    [[ "$(dante_candidate_action ubuntu 20.04 1.4.2+dfsg-7 2.31)" == "refuse" ]] || { echo "ubuntu 20.04 glibc 2.31 must refuse"; rc=1; }
+    [[ "$(dante_candidate_action linuxmint 22 1.4.3+dfsg-1 2.39)" == "replace" ]] || { echo "mint 22 on noble glibc must replace"; rc=1; }
     [[ "$(dante_fallback_suite riscv64)" == "forky" ]] || { echo "dante suite riscv64 failed"; rc=1; }
     if dante_fallback_suite armhf >/dev/null; then
         echo "dante suite armhf should fail"
@@ -1928,7 +1966,7 @@ Usage: sudo ./proxy-installer.sh
        sudo ./proxy-installer.sh --help
 
 Interactive installer for Squid (HTTP CONNECT) and Dante (SOCKS5)
-on Debian 13+ / Ubuntu 20.04+ and derivatives.
+on Debian 13+ / Ubuntu 24.04+ and derivatives.
 
 Do not pipe this script into bash: menus need a TTY.
 EOF

@@ -3,7 +3,7 @@
 An interactive Bash script for installing and configuring a forward HTTP/HTTPS proxy (Squid, CONNECT method) and a SOCKS5 proxy (Dante) with password and/or IP-whitelist access on Debian and Ubuntu.
 
 ## Features
-- Debian 11+ / Ubuntu 20.04+ and derivatives (Linux Mint, Pop!_OS, and other apt-based systems). Debian 13 does not ship Dante; the installer adds only `dante-server` 1.4.4 from Debian testing (forky). Debian 12 and older stop with an error: their packaged Dante is 1.4.2, which is vulnerable to CVE-2024-54662, and the fixed build needs glibc 2.38.
+- Debian 13+ / Ubuntu 24.04+ and derivatives (Linux Mint, Pop!_OS, and other apt-based systems). Debian 13 and Ubuntu 24.04 do not ship a fixed Dante, so the installer adds only `dante-server` 1.4.4 from Debian testing (forky). Debian 12 and older, and Ubuntu 20.04 and 22.04, stop with an error: their Dante is older than 1.4.4 (CVE-2024-54662) and the fixed build needs glibc 2.38.
 - Installs Squid (HTTP CONNECT) and Dante (SOCKS5) with Fail2ban protection
 - Optional Unbound DNS resolver bound to **127.0.0.1 only** (used by Squid, not exposed to the internet)
 - Optional BBR/sysctl tuning via `/etc/sysctl.d/` (no duplicate lines in `sysctl.conf`; skipped if the kernel cannot apply it)
@@ -16,7 +16,7 @@ An interactive Bash script for installing and configuring a forward HTTP/HTTPS p
 - Full cleanup or in-place reconfigure on rerun
 
 ## Requirements
-- Debian 13+ or Ubuntu 20.04+ (Debian 12 and older are refused: their Dante package is vulnerable to CVE-2024-54662)
+- Debian 13+ or Ubuntu 24.04+. Debian 12 and older, and Ubuntu 20.04 and 22.04, are refused: their Dante package is older than 1.4.4 (CVE-2024-54662) and the fixed build needs glibc 2.38. Ubuntu 24.04 and Debian 13 install Dante 1.4.4 from Debian testing.
 - Root privileges
 - An interactive terminal (do not pipe the script into bash)
 
