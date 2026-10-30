@@ -65,11 +65,11 @@ bash proxy-installer.sh --selftest
 - Опционально Unbound и сетевые оптимизации
 - Опционально включение UFW (порт SSH разрешается до включения)
 
-После завершения выводятся данные подключения. Повторный запуск предлагает полную очистку или перезапись конфигурации.
+После завершения выводятся данные подключения. Повторный запуск открывает меню: переустановка всего или отдельная установка, перенастройка и удаление Unbound, UFW и Fail2ban.
 
 ## Устранение неполадок
 - При сетевых ошибках проверьте исходящий HTTPS (пинг ICMP не обязателен).
-- Логи: `/var/log/squid/access.log`, `/var/log/danted.log`, `/var/log/fail2ban.log`
+- Логи: `/var/log/squid/access.log`, `/var/log/danted.log`, `/var/log/fail2ban.log`. Журнал установщика, только для root: `/var/log/proxy-installer.log`
 - Статус служб: `sudo systemctl status squid danted fail2ban unbound`
 - Firewall: `sudo ufw status` (копия правил: `/etc/ufw/ufw.rules.backup`) или `sudo firewall-cmd --list-ports`
 - Проверка конфига Squid: `sudo squid -k parse`

@@ -40,6 +40,8 @@ SQUID_PASSWD="/etc/squid/passwd"
 SQUID_CONF="/etc/squid/squid.conf"
 DANTE_CONF="/etc/danted.conf"
 DANTE_LOG="/var/log/danted.log"
+INSTALL_LOG="/var/log/proxy-installer.log"
+INSTALL_LOG_READY=0
 DANTE_APT_LIST="/etc/apt/sources.list.d/proxy-installer-dante.list"
 DANTE_APT_PIN="/etc/apt/preferences.d/proxy-installer-dante"
 
@@ -71,10 +73,36 @@ USERS_TO_DELETE=()
 # Helpers
 # ====================================================================
 
-log_ok()   { echo -e "${C_GREEN}[+]${C_RESET} $*"; }
-log_info() { echo -e "${C_BLUE}[*]${C_RESET} $*"; }
-log_warn() { echo -e "${C_YELLOW}[!]${C_RESET} $*"; }
-log_err()  { echo -e "${C_RED}[x]${C_RESET} $*" >&2; }
+log_write() {
+    local level="$1"
+    shift
+    [[ "$INSTALL_LOG_READY" == "1" ]] || return 0
+    [[ -n "$INSTALL_LOG" ]] || return 0
+    printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$level" "$*" >> "$INSTALL_LOG" || return 0
+    if [[ "${EUID}" -eq 0 ]]; then
+        chown root:root "$INSTALL_LOG" 2>/dev/null || true
+        chmod 600 "$INSTALL_LOG" 2>/dev/null || true
+    fi
+}
+
+log_ok()   { log_write OK "$*";   echo -e "${C_GREEN}[+]${C_RESET} $*"; }
+log_info() { log_write INFO "$*"; echo -e "${C_BLUE}[*]${C_RESET} $*"; }
+log_warn() { log_write WARN "$*"; echo -e "${C_YELLOW}[!]${C_RESET} $*"; }
+log_err()  { log_write ERROR "$*"; echo -e "${C_RED}[x]${C_RESET} $*" >&2; }
+
+init_install_log() {
+    local previous_umask
+    previous_umask="$(umask)"
+    umask 077
+    touch "$INSTALL_LOG"
+    umask "$previous_umask"
+    if [[ "${EUID}" -eq 0 ]]; then
+        chown root:root "$INSTALL_LOG" 2>/dev/null || true
+        chmod 600 "$INSTALL_LOG"
+    fi
+    INSTALL_LOG_READY=1
+    log_write SESSION "======== новая установка: запуск ${SCRIPT_VERSION}, pid $$ ========"
+}
 
 die() {
     log_err "$*"
@@ -94,7 +122,7 @@ print_banner() {
     echo
     echo "Установка Squid (HTTP/HTTPS CONNECT) и Dante (SOCKS5)"
     echo "на Debian 13+ и Ubuntu 24.04+."
-    echo "Fail2ban, опциональный Unbound и настройка firewall."
+    echo "Меню: установка, переустановка и удаление отдельных частей."
     echo
 }
 
@@ -855,7 +883,7 @@ install_packages() {
     local pkgs=(squid dante-server apache2-utils fail2ban)
     command_exists curl || pkgs+=(curl)
     command_exists ip && command_exists ss || pkgs+=(iproute2)
-    [[ "$INSTALL_UNBOUND" == true ]] && pkgs+=(unbound)
+    [[ "$INSTALL_UNBOUND" == true ]] && pkgs+=(unbound dns-root-data)
 
     local fail2ban_existed=0 unbound_existed=0
     dpkg -s fail2ban >/dev/null 2>&1 && fail2ban_existed=1
@@ -908,6 +936,34 @@ apply_sysctl() {
     fi
 }
 
+ensure_unbound_root_key() {
+    # unbound refuses to start until this trust anchor exists. The package
+    # helper copies it from dns-root-data, but that copy is skipped when the
+    # recommended package was not installed.
+    local key="/var/lib/unbound/root.key"
+    mkdir -p /var/lib/unbound
+    if getent passwd unbound >/dev/null 2>&1; then
+        chown unbound:unbound /var/lib/unbound
+    fi
+    if [[ -x /usr/libexec/unbound-helper ]]; then
+        /usr/libexec/unbound-helper root_trust_anchor_update || true
+    fi
+    if [[ ! -s "$key" && -r /usr/share/dns/root.key ]]; then
+        if getent passwd unbound >/dev/null 2>&1; then
+            install -o unbound -g unbound -m 644 /usr/share/dns/root.key "$key"
+        else
+            install -m 644 /usr/share/dns/root.key "$key"
+        fi
+    fi
+    if [[ ! -s "$key" ]] && command_exists unbound-anchor; then
+        unbound-anchor -a "$key" || true
+        if getent passwd unbound >/dev/null 2>&1; then
+            chown unbound:unbound "$key" 2>/dev/null || true
+        fi
+    fi
+    [[ -s "$key" ]]
+}
+
 configure_unbound() {
     [[ "$INSTALL_UNBOUND" == true ]] || return 0
     echo -e "\n${C_YELLOW}--- Настройка Unbound (только localhost) ---${C_RESET}"
@@ -949,6 +1005,13 @@ server:
     num-threads: ${threads}
     verbosity: 1
 EOF
+
+    if ! ensure_unbound_root_key; then
+        log_warn "Не удалось создать /var/lib/unbound/root.key. Локальный DNS не будет включён."
+        rm -f "$UNBOUND_DROPIN"
+        INSTALL_UNBOUND=false
+        return 0
+    fi
 
     if ! unbound-checkconf >/dev/null 2>&1; then
         local check_out
@@ -1328,6 +1391,12 @@ EOF
 # Firewall
 # ====================================================================
 
+ufw_output_allows_port() {
+    local text="$1" port="$2" proto="${3:-tcp}"
+    grep -Eq "(^|[[:space:]])allow[[:space:]]+${port}/${proto}([[:space:]]|$)" <<<"$text" && return 0
+    grep -Eq -- "--dport ${port}([^0-9]|$)" <<<"$text"
+}
+
 setup_firewall() {
     echo -e "\n${C_YELLOW}--- Настройка firewall ---${C_RESET}"
     detect_ssh_port
@@ -1391,9 +1460,12 @@ setup_firewall() {
 
     if [[ "$ENABLE_UFW" == true ]]; then
         local status_text
-        status_text="$(ufw status 2>/dev/null || true)"
+        # While UFW is inactive, "ufw status" prints only "Status: inactive"
+        # and hides the rules that "ufw allow" already stored.
+        status_text="$(ufw show added 2>/dev/null || true)"
+        status_text+=$'\n'"$(cat /etc/ufw/user.rules /etc/ufw/user6.rules 2>/dev/null || true)"
         for ssh_port in "${SSH_PORTS[@]}"; do
-            if ! grep -q "${ssh_port}/tcp" <<<"$status_text"; then
+            if ! ufw_output_allows_port "$status_text" "$ssh_port" tcp; then
                 die "Правило SSH ${ssh_port}/tcp не появилось в UFW. Включение firewall отменено, чтобы не потерять доступ."
             fi
         done
@@ -1410,6 +1482,7 @@ save_runtime_state() {
     state_set SQUID_PORT "$SQUID_PORT"
     state_set DANTE_PORT "$DANTE_PORT"
     state_set AUTH_CHOICE "$AUTH_CHOICE"
+    state_set WHITELIST_IPS "$WHITELIST_IPS"
 }
 
 # ====================================================================
@@ -1508,6 +1581,7 @@ create_or_update_users() {
             useradd --system --no-create-home --shell "$NOLOGIN_SHELL" --comment "proxy-installer" "$user" \
                 || die "Не удалось создать пользователя '$user'."
             remember_user "$user"
+            log_ok "Создан пользователь прокси '$user'."
         fi
 
         chage -m 0 -M 99999 -I -1 -E -1 "$user" >/dev/null 2>&1 || true
@@ -1522,6 +1596,7 @@ create_or_update_users() {
                 || die "Не удалось добавить '$user' в ${SQUID_PASSWD}."
         fi
         add_squid_case_alias "$user" || die "Не удалось добавить строчный алиас Squid для '$user'."
+        log_ok "Пароль пользователя прокси '$user' записан для Dante и Squid."
         password=""
     done
 
@@ -1561,6 +1636,14 @@ restart_one() {
 restart_services() {
     echo -e "\n${C_YELLOW}--- Шаг 5: Запуск служб ---${C_RESET}"
     if [[ "$INSTALL_UNBOUND" == true ]]; then
+        if ! ensure_unbound_root_key; then
+            log_warn "Нет /var/lib/unbound/root.key. Unbound не запускаю, Squid останется на системном DNS."
+            sed -i '/^dns_nameservers /d' "$SQUID_CONF"
+            INSTALL_UNBOUND=false
+        fi
+    fi
+    if [[ "$INSTALL_UNBOUND" == true ]]; then
+        systemctl reset-failed unbound >/dev/null 2>&1 || true
         if restart_one unbound 0; then
             log_ok "Unbound слушает 127.0.0.1:53."
         else
@@ -1591,41 +1674,267 @@ show_public_ip() {
 # ====================================================================
 
 maybe_cleanup_previous() {
-    if ! dpkg -s squid >/dev/null 2>&1 && ! dpkg -s dante-server >/dev/null 2>&1 && [[ ! -f "$STATE_FILE" ]]; then
-        return 0
-    fi
+    return 0
+}
 
-    echo -e "\n${C_YELLOW}Обнаружена предыдущая установка Squid/Dante или состояние установщика.${C_RESET}"
-    echo "  1) Полная очистка и новая установка (рекомендуется)"
-    echo "  2) Только перезаписать конфигурацию (пакеты сохранить)"
-    echo "  3) Отмена"
-    local choice
+installer_present() {
+    dpkg -s squid >/dev/null 2>&1 && return 0
+    dpkg -s dante-server >/dev/null 2>&1 && return 0
+    [[ -f "$STATE_FILE" || -f "$UNBOUND_DROPIN" || -f "$FAIL2BAN_JAIL" ]]
+}
+
+squid_port_from_conf() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    awk '/^http_port[[:space:]]+[0-9]/ {gsub(/[^0-9].*/, "", $2); if ($2+0 > 0) {print $2; exit}}' "$file"
+}
+
+dante_port_from_conf() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    awk '/^internal:[[:space:]]/ && /port[[:space:]]*=/ {
+        for (i=1; i<=NF; i++) if ($i=="=") {gsub(/[^0-9]/, "", $(i+1)); print $(i+1); exit}
+    }' "$file"
+}
+
+load_runtime_settings() {
+    SQUID_PORT="$(state_get SQUID_PORT)"
+    DANTE_PORT="$(state_get DANTE_PORT)"
+    AUTH_CHOICE="$(state_get AUTH_CHOICE)"
+    WHITELIST_IPS="$(state_get WHITELIST_IPS)"
+    if [[ -z "$SQUID_PORT" ]]; then
+        SQUID_PORT="$(squid_port_from_conf "$SQUID_CONF" 2>/dev/null || true)"
+    fi
+    if [[ -z "$DANTE_PORT" ]]; then
+        DANTE_PORT="$(dante_port_from_conf "$DANTE_CONF" 2>/dev/null || true)"
+    fi
+}
+
+require_proxy_ports() {
+    load_runtime_settings
+    if [[ -z "$SQUID_PORT" ]]; then
+        local value=""
+        while true; do
+            read -r -e -i 3128 -p "Порт Squid [1-65535]: " value
+            validate_port "$value" || continue
+            SQUID_PORT="$(normalize_port "$value")"
+            break
+        done
+    fi
+    if [[ -z "$DANTE_PORT" ]]; then
+        local value=""
+        while true; do
+            read -r -e -i 1080 -p "Порт Dante [1-65535]: " value
+            validate_port "$value" || continue
+            DANTE_PORT="$(normalize_port "$value")"
+            break
+        done
+    fi
+    save_runtime_state
+}
+
+point_squid_at_unbound() {
+    [[ -f "$SQUID_CONF" ]] || return 0
+    if grep -q '^dns_nameservers ' "$SQUID_CONF"; then
+        sed -i 's/^dns_nameservers .*/dns_nameservers 127.0.0.1/' "$SQUID_CONF"
+    else
+        printf '\ndns_nameservers 127.0.0.1\n' >> "$SQUID_CONF"
+    fi
+    if systemctl is-active squid >/dev/null 2>&1; then
+        systemctl try-restart squid >/dev/null 2>&1 || log_warn "Squid не перезапустился после смены DNS."
+    fi
+}
+
+repair_unbound() {
+    echo -e "\n${C_YELLOW}--- Unbound: установка и настройка ---${C_RESET}"
+    local existed=0
+    dpkg -s unbound >/dev/null 2>&1 && existed=1
+    INSTALL_UNBOUND=true
+    apt_install unbound dns-root-data
+    state_set INSTALLED_UNBOUND 1
+    if [[ "$(state_get UNBOUND_PREEXISTED)" != "1" ]]; then
+        state_set UNBOUND_PREEXISTED "$existed"
+    fi
+    configure_unbound
+    if [[ "$INSTALL_UNBOUND" != true ]]; then
+        return 1
+    fi
+    systemctl reset-failed unbound >/dev/null 2>&1 || true
+    if ! restart_one unbound 0; then
+        return 1
+    fi
+    point_squid_at_unbound
+    log_ok "Unbound слушает 127.0.0.1:53 и подключён к Squid, если конфиг Squid уже есть."
+}
+
+remove_unbound() {
+    echo -e "\n${C_YELLOW}--- Unbound: удаление ---${C_RESET}"
+    systemctl stop unbound >/dev/null 2>&1 || true
+    systemctl disable unbound >/dev/null 2>&1 || true
+    rm -f "$UNBOUND_DROPIN"
+    if [[ -f "$SQUID_CONF" ]]; then
+        sed -i '/^dns_nameservers /d' "$SQUID_CONF"
+        systemctl try-restart squid >/dev/null 2>&1 || true
+    fi
+    if dpkg -s unbound >/dev/null 2>&1; then
+        if ask_yes_no "Удалить пакеты unbound и dns-root-data" "y"; then
+            apt-get purge -y unbound dns-root-data || log_warn "Не удалось полностью удалить пакеты Unbound."
+        fi
+    fi
+    state_set INSTALLED_UNBOUND 0
+    log_ok "Настройка Unbound от этого установщика снята."
+}
+
+repair_ufw() {
+    echo -e "\n${C_YELLOW}--- UFW: правила прокси и включение ---${C_RESET}"
+    require_proxy_ports
+    ENABLE_UFW=true
+    setup_firewall
+}
+
+remove_ufw_rules() {
+    echo -e "\n${C_YELLOW}--- UFW: снятие правил прокси ---${C_RESET}"
+    load_runtime_settings
+    if [[ -n "$SQUID_PORT" ]]; then
+        remove_ufw_port "$SQUID_PORT"
+    fi
+    if [[ -n "$DANTE_PORT" ]]; then
+        remove_ufw_port "$DANTE_PORT"
+    fi
+    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        if ask_yes_no "Выключить UFW целиком" "n"; then
+            ufw disable || log_warn "Не удалось выключить UFW."
+        fi
+    fi
+    log_ok "Правила портов прокси убраны из UFW."
+}
+
+repair_fail2ban() {
+    echo -e "\n${C_YELLOW}--- Fail2ban: перенастройка ---${C_RESET}"
+    require_proxy_ports
+    local existed=0
+    dpkg -s fail2ban >/dev/null 2>&1 && existed=1
+    apt_install fail2ban
+    state_set INSTALLED_FAIL2BAN 1
+    if [[ "$(state_get FAIL2BAN_PREEXISTED)" != "1" ]]; then
+        state_set FAIL2BAN_PREEXISTED "$existed"
+    fi
+    configure_fail2ban
+    systemctl reset-failed fail2ban >/dev/null 2>&1 || true
+    restart_one fail2ban 0 || return 1
+}
+
+remove_fail2ban_rules() {
+    echo -e "\n${C_YELLOW}--- Fail2ban: снятие правил установщика ---${C_RESET}"
+    rm -f "$FAIL2BAN_JAIL" "$FAIL2BAN_FILTER" "$FAIL2BAN_SQUID_FILTER"
+    if systemctl is-active fail2ban >/dev/null 2>&1; then
+        systemctl reload fail2ban >/dev/null 2>&1 || systemctl restart fail2ban >/dev/null 2>&1 || true
+    fi
+    if dpkg -s fail2ban >/dev/null 2>&1 && ask_yes_no "Удалить пакет fail2ban" "n"; then
+        systemctl stop fail2ban >/dev/null 2>&1 || true
+        apt-get purge -y fail2ban || log_warn "Не удалось удалить fail2ban."
+        state_set INSTALLED_FAIL2BAN 0
+    fi
+    log_ok "Правила Fail2ban этого установщика сняты."
+}
+
+restart_proxy_services() {
+    echo -e "\n${C_YELLOW}--- Перезапуск Squid и Dante ---${C_RESET}"
+    dpkg -s squid >/dev/null 2>&1 || { log_err "Пакет squid не установлен."; return 1; }
+    dpkg -s dante-server >/dev/null 2>&1 || { log_err "Пакет dante-server не установлен."; return 1; }
+    restart_one squid 1
+    restart_one danted 1
+}
+
+run_full_install() {
+    log_info "Начата полная установка или переустановка."
+    if installer_present; then
+        echo
+        echo "Уже есть установка Squid, Dante или файлы этого скрипта."
+        if ask_yes_no "Удалить её и поставить заново с новыми настройками" "y"; then
+            local tracked_preview=""
+            tracked_preview="$(read_tracked_users | tr '\n' ' ')"
+            if [[ -n "$tracked_preview" ]]; then
+                log_info "Будут удалены учётные записи: ${tracked_preview}"
+            fi
+            cleanup
+        else
+            log_info "Пакеты сохраняются. Конфигурация будет записана заново."
+        fi
+    fi
+    mkdir -p "$STATE_DIR"
+    collect_settings
+    echo
+    log_ok "Параметры собраны, начинаем установку."
+    sleep 1
+    install_packages
+    assert_ports_still_free
+    apply_sysctl
+    create_or_update_users
+    configure_unbound
+    configure_squid
+    configure_dante
+    configure_fail2ban
+    restart_services
+    print_summary
+}
+
+component_menu() {
     while true; do
-        read -r -p "Ваш выбор [1-3]: " choice
+        load_runtime_settings
+        echo
+        echo -e "${C_YELLOW}Отдельные компоненты${C_RESET}"
+        echo "  Squid: ${SQUID_PORT:-не задан}    Dante: ${DANTE_PORT:-не задан}"
+        echo "  1) Unbound — установить или перенастроить"
+        echo "  2) Unbound — удалить"
+        echo "  3) UFW — открыть порты прокси и включить"
+        echo "  4) UFW — убрать правила прокси"
+        echo "  5) Fail2ban — перенастроить"
+        echo "  6) Fail2ban — убрать правила установщика"
+        echo "  7) Перезапустить Squid и Dante"
+        echo "  8) Назад"
+        local choice=""
+        read -r -p "Ваш выбор [1-8]: " choice
         case "$choice" in
-            1)
-                local tracked_preview
-                tracked_preview="$(read_tracked_users | tr '\n' ' ')"
-                if [[ -n "$tracked_preview" ]]; then
-                    log_info "Будут удалены учётные записи: $tracked_preview"
-                else
-                    echo "Введите имена пользователей прошлой установки (через пробел), либо Enter."
-                    local input=""
-                    read -r -p "> " input
-                    IFS=' ' read -r -a USERS_TO_DELETE <<< "$input"
-                fi
-                cleanup
-                return 0
-                ;;
-            2)
-                log_info "Пакеты сохраняются, конфигурация будет перезаписана."
-                return 0
-                ;;
+            1) repair_unbound || true ;;
+            2) remove_unbound ;;
+            3) repair_ufw ;;
+            4) remove_ufw_rules ;;
+            5) repair_fail2ban ;;
+            6) remove_fail2ban_rules ;;
+            7) restart_proxy_services ;;
+            8) return 0 ;;
+            *) log_err "Введите число от 1 до 8." ;;
+        esac
+    done
+}
+
+main_menu() {
+    while true; do
+        echo
+        echo -e "${C_YELLOW}Главное меню${C_RESET}"
+        echo "  1) Установить или переустановить всё"
+        echo "  2) Отдельный компонент: установить, перенастроить или удалить"
+        echo "  3) Полностью удалить то, что поставил этот скрипт"
+        echo "  4) Выход"
+        local choice=""
+        read -r -p "Ваш выбор [1-4]: " choice
+        case "$choice" in
+            1) run_full_install; return 0 ;;
+            2) component_menu ;;
             3)
-                echo "Установка отменена."
-                exit 0
+                if ! installer_present; then
+                    log_info "Установка скрипта не обнаружена."
+                    continue
+                fi
+                if ask_yes_no "Удалить Squid, Dante, настройки Unbound, Fail2ban и UFW этого скрипта" "n"; then
+                    cleanup
+                    log_ok "Удаление завершено."
+                    return 0
+                fi
                 ;;
-            *) log_err "Введите 1, 2 или 3." ;;
+            4) exit 0 ;;
+            *) log_err "Введите число от 1 до 4." ;;
         esac
     done
 }
@@ -1797,7 +2106,8 @@ print_summary() {
         echo -e "  ${C_YELLOW}Unbound DNS:${C_RESET}         127.0.0.1:53 (только для Squid)"
     fi
     echo
-    echo "Логи: /var/log/squid/access.log , ${DANTE_LOG} , /var/log/fail2ban.log"
+    echo "Логи прокси: /var/log/squid/access.log , ${DANTE_LOG} , /var/log/fail2ban.log"
+    echo "Журнал установщика (только root): ${INSTALL_LOG}"
     echo "Состояние установщика: ${STATE_FILE}"
     echo
     echo "Проверка Squid:  curl -x http://USER:PASS@${SERVER_IP}:${SQUID_PORT} https://example.com"
@@ -1850,7 +2160,51 @@ selftest() {
         expect_ok validate_ip_or_cidr 2001:db8::/32
     fi
 
+    local port_sample
+    port_sample="$(mktemp)"
+    cat > "$port_sample" <<'EOF'
+http_port 3128
+internal: 0.0.0.0 port = 1080
+EOF
     [[ "$(normalize_port 03128)" == "3128" ]] || { echo "normalize_port failed"; rc=1; }
+    local log_sample previous_ready previous_path
+    log_sample="$(mktemp)"
+    previous_ready="$INSTALL_LOG_READY"
+    previous_path="$INSTALL_LOG"
+    INSTALL_LOG="$log_sample"
+    INSTALL_LOG_READY=1
+    log_write SESSION "======== новая установка: запуск test ========"
+    log_write OK "Пользователь прокси 'alice' записан"
+    log_write ERROR "пример ошибки"
+    log_write SESSION "======== новая установка: запуск test-2 ========"
+    [[ "$(grep -c 'новая установка' "$log_sample")" -eq 2 ]] || { echo "install log must append sessions"; rc=1; }
+    grep -q "\[OK\] Пользователь прокси 'alice' записан" "$log_sample" || { echo "install log missed user"; rc=1; }
+    grep -q "\[ERROR\] пример ошибки" "$log_sample" || { echo "install log missed error"; rc=1; }
+    INSTALL_LOG_READY="$previous_ready"
+    INSTALL_LOG="$previous_path"
+    rm -f "$log_sample"
+    [[ "$(squid_port_from_conf "$port_sample")" == "3128" ]] || { echo "squid port parse failed"; rc=1; }
+    [[ "$(dante_port_from_conf "$port_sample")" == "1080" ]] || { echo "dante port parse failed"; rc=1; }
+    rm -f "$port_sample"
+    inactive=$'Status: inactive\n'
+    added=$'Added user rules:\nufw allow 22/tcp comment SSH\n'
+    rules='-A ufw-user-input -p tcp --dport 22 -j ACCEPT'
+    if ufw_output_allows_port "$inactive" 22 tcp; then
+        echo "inactive ufw status must not count as an SSH rule"
+        rc=1
+    fi
+    if ! ufw_output_allows_port "$added" 22 tcp; then
+        echo "ufw show added should allow 22/tcp"
+        rc=1
+    fi
+    if ! ufw_output_allows_port "$rules" 22 tcp; then
+        echo "ufw user.rules should allow 22/tcp"
+        rc=1
+    fi
+    if ufw_output_allows_port "$added" 2222 tcp; then
+        echo "port 2222 must not match a 22 rule"
+        rc=1
+    fi
     [[ "$(dante_candidate_action debian 12 1.4.2+dfsg-7)" == "refuse" ]] || { echo "debian 12 must refuse dante 1.4.2"; rc=1; }
     [[ "$(dante_candidate_action debian 11 1.4.2+dfsg-7+b2)" == "refuse" ]] || { echo "debian 11 must refuse dante 1.4.2"; rc=1; }
     [[ "$(dante_candidate_action debian 13 1.4.2+dfsg-7)" == "replace" ]] || { echo "debian 13 must replace dante 1.4.2"; rc=1; }
@@ -1988,6 +2342,7 @@ main() {
     print_banner
 
     is_root || die "Запустите скрипт с правами root (sudo)."
+    init_install_log
     is_tty || die "Нужен интерактивный терминал. Скачайте скрипт и запустите: sudo ./proxy-installer.sh"
 
     detect_os
@@ -2004,24 +2359,7 @@ main() {
     fi
 
     maybe_cleanup_previous
-    mkdir -p "$STATE_DIR"
-    collect_settings
-
-    echo
-    log_ok "Параметры собраны, начинаем установку."
-    sleep 1
-
-    install_packages
-    assert_ports_still_free
-    apply_sysctl
-    create_or_update_users
-    configure_unbound
-    configure_squid
-    configure_dante
-    configure_fail2ban
-
-    restart_services
-    print_summary
+    main_menu
 }
 
 main "$@"
