@@ -651,6 +651,9 @@ cleanup() {
             systemctl stop unbound 2>/dev/null || true
             apt-get purge -y unbound >/dev/null 2>&1 || true
         fi
+        if [[ "$(state_get DNS_ROOT_DATA_PREEXISTED)" == "0" ]]; then
+            apt-get purge -y dns-root-data >/dev/null 2>&1 || true
+        fi
     fi
     rm -f "$UNBOUND_DROPIN"
     if [[ "$(state_get UNBOUND_PREEXISTED)" == "1" ]] && systemctl is-enabled unbound >/dev/null 2>&1; then
@@ -885,9 +888,10 @@ install_packages() {
     command_exists ip && command_exists ss || pkgs+=(iproute2)
     [[ "$INSTALL_UNBOUND" == true ]] && pkgs+=(unbound dns-root-data)
 
-    local fail2ban_existed=0 unbound_existed=0
+    local fail2ban_existed=0 unbound_existed=0 dnsroot_existed=0
     dpkg -s fail2ban >/dev/null 2>&1 && fail2ban_existed=1
     dpkg -s unbound >/dev/null 2>&1 && unbound_existed=1
+    dpkg -s dns-root-data >/dev/null 2>&1 && dnsroot_existed=1
 
     apt_install "${pkgs[@]}"
     state_set INSTALLED_FAIL2BAN 1
@@ -895,6 +899,9 @@ install_packages() {
     if [[ "$INSTALL_UNBOUND" == true ]]; then
         state_set INSTALLED_UNBOUND 1
         state_set UNBOUND_PREEXISTED "$unbound_existed"
+        if [[ -z "$(state_get DNS_ROOT_DATA_PREEXISTED)" ]]; then
+            state_set DNS_ROOT_DATA_PREEXISTED "$dnsroot_existed"
+        fi
     fi
     log_ok "Пакеты установлены."
 }
@@ -1747,13 +1754,18 @@ point_squid_at_unbound() {
 
 repair_unbound() {
     echo -e "\n${C_YELLOW}--- Unbound: установка и настройка ---${C_RESET}"
-    local existed=0
+    prepare_package_install
+    local existed=0 dnsroot_existed=0
     dpkg -s unbound >/dev/null 2>&1 && existed=1
+    dpkg -s dns-root-data >/dev/null 2>&1 && dnsroot_existed=1
     INSTALL_UNBOUND=true
     apt_install unbound dns-root-data
     state_set INSTALLED_UNBOUND 1
-    if [[ "$(state_get UNBOUND_PREEXISTED)" != "1" ]]; then
+    if [[ -z "$(state_get UNBOUND_PREEXISTED)" ]]; then
         state_set UNBOUND_PREEXISTED "$existed"
+    fi
+    if [[ -z "$(state_get DNS_ROOT_DATA_PREEXISTED)" ]]; then
+        state_set DNS_ROOT_DATA_PREEXISTED "$dnsroot_existed"
     fi
     configure_unbound
     if [[ "$INSTALL_UNBOUND" != true ]]; then
@@ -1777,9 +1789,12 @@ remove_unbound() {
         systemctl try-restart squid >/dev/null 2>&1 || true
     fi
     if dpkg -s unbound >/dev/null 2>&1; then
-        if ask_yes_no "Удалить пакеты unbound и dns-root-data" "y"; then
-            apt-get purge -y unbound dns-root-data || log_warn "Не удалось полностью удалить пакеты Unbound."
+        if ask_yes_no "Удалить пакет unbound" "y"; then
+            apt-get purge -y unbound || log_warn "Не удалось полностью удалить пакет unbound."
         fi
+    fi
+    if [[ "$(state_get DNS_ROOT_DATA_PREEXISTED)" == "0" ]] && dpkg -s dns-root-data >/dev/null 2>&1; then
+        apt-get purge -y dns-root-data || log_warn "Не удалось удалить пакет dns-root-data."
     fi
     state_set INSTALLED_UNBOUND 0
     log_ok "Настройка Unbound от этого установщика снята."
@@ -1787,6 +1802,11 @@ remove_unbound() {
 
 repair_ufw() {
     echo -e "\n${C_YELLOW}--- UFW: правила прокси и включение ---${C_RESET}"
+    if ! dpkg -s ufw >/dev/null 2>&1 || ! command_exists ss; then
+        prepare_package_install
+    else
+        detect_ssh_port
+    fi
     require_proxy_ports
     ENABLE_UFW=true
     setup_firewall
@@ -1811,6 +1831,7 @@ remove_ufw_rules() {
 
 repair_fail2ban() {
     echo -e "\n${C_YELLOW}--- Fail2ban: перенастройка ---${C_RESET}"
+    prepare_package_install
     require_proxy_ports
     local existed=0
     dpkg -s fail2ban >/dev/null 2>&1 && existed=1
@@ -1846,8 +1867,22 @@ restart_proxy_services() {
     restart_one danted 1
 }
 
+prepare_package_install() {
+    check_internet
+    check_disk
+    ensure_iproute
+    detect_ssh_port
+    if ipv6_is_enabled; then
+        IPV6_ENABLED=true
+        log_info "IPv6 включён: Squid и Dante будут слушать его тоже."
+    else
+        IPV6_ENABLED=false
+    fi
+}
+
 run_full_install() {
     log_info "Начата полная установка или переустановка."
+    prepare_package_install
     if installer_present; then
         echo
         echo "Уже есть установка Squid, Dante или файлы этого скрипта."
@@ -2347,13 +2382,9 @@ main() {
 
     detect_os
     detect_nologin
-    check_internet
-    check_disk
-    ensure_iproute
     detect_ssh_port
     if ipv6_is_enabled; then
         IPV6_ENABLED=true
-        log_info "IPv6 включён: Squid и Dante будут слушать его тоже."
     else
         IPV6_ENABLED=false
     fi
