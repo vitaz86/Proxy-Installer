@@ -855,7 +855,7 @@ install_packages() {
     local pkgs=(squid dante-server apache2-utils fail2ban)
     command_exists curl || pkgs+=(curl)
     command_exists ip && command_exists ss || pkgs+=(iproute2)
-    [[ "$INSTALL_UNBOUND" == true ]] && pkgs+=(unbound)
+    [[ "$INSTALL_UNBOUND" == true ]] && pkgs+=(unbound dns-root-data)
 
     local fail2ban_existed=0 unbound_existed=0
     dpkg -s fail2ban >/dev/null 2>&1 && fail2ban_existed=1
@@ -908,6 +908,34 @@ apply_sysctl() {
     fi
 }
 
+ensure_unbound_root_key() {
+    # unbound refuses to start until this trust anchor exists. The package
+    # helper copies it from dns-root-data, but that copy is skipped when the
+    # recommended package was not installed.
+    local key="/var/lib/unbound/root.key"
+    mkdir -p /var/lib/unbound
+    if getent passwd unbound >/dev/null 2>&1; then
+        chown unbound:unbound /var/lib/unbound
+    fi
+    if [[ -x /usr/libexec/unbound-helper ]]; then
+        /usr/libexec/unbound-helper root_trust_anchor_update || true
+    fi
+    if [[ ! -s "$key" && -r /usr/share/dns/root.key ]]; then
+        if getent passwd unbound >/dev/null 2>&1; then
+            install -o unbound -g unbound -m 644 /usr/share/dns/root.key "$key"
+        else
+            install -m 644 /usr/share/dns/root.key "$key"
+        fi
+    fi
+    if [[ ! -s "$key" ]] && command_exists unbound-anchor; then
+        unbound-anchor -a "$key" || true
+        if getent passwd unbound >/dev/null 2>&1; then
+            chown unbound:unbound "$key" 2>/dev/null || true
+        fi
+    fi
+    [[ -s "$key" ]]
+}
+
 configure_unbound() {
     [[ "$INSTALL_UNBOUND" == true ]] || return 0
     echo -e "\n${C_YELLOW}--- Настройка Unbound (только localhost) ---${C_RESET}"
@@ -949,6 +977,13 @@ server:
     num-threads: ${threads}
     verbosity: 1
 EOF
+
+    if ! ensure_unbound_root_key; then
+        log_warn "Не удалось создать /var/lib/unbound/root.key. Локальный DNS не будет включён."
+        rm -f "$UNBOUND_DROPIN"
+        INSTALL_UNBOUND=false
+        return 0
+    fi
 
     if ! unbound-checkconf >/dev/null 2>&1; then
         local check_out
@@ -1328,6 +1363,12 @@ EOF
 # Firewall
 # ====================================================================
 
+ufw_output_allows_port() {
+    local text="$1" port="$2" proto="${3:-tcp}"
+    grep -Eq "(^|[[:space:]])allow[[:space:]]+${port}/${proto}([[:space:]]|$)" <<<"$text" && return 0
+    grep -Eq -- "--dport ${port}([^0-9]|$)" <<<"$text"
+}
+
 setup_firewall() {
     echo -e "\n${C_YELLOW}--- Настройка firewall ---${C_RESET}"
     detect_ssh_port
@@ -1391,9 +1432,12 @@ setup_firewall() {
 
     if [[ "$ENABLE_UFW" == true ]]; then
         local status_text
-        status_text="$(ufw status 2>/dev/null || true)"
+        # While UFW is inactive, "ufw status" prints only "Status: inactive"
+        # and hides the rules that "ufw allow" already stored.
+        status_text="$(ufw show added 2>/dev/null || true)"
+        status_text+=$'\n'"$(cat /etc/ufw/user.rules /etc/ufw/user6.rules 2>/dev/null || true)"
         for ssh_port in "${SSH_PORTS[@]}"; do
-            if ! grep -q "${ssh_port}/tcp" <<<"$status_text"; then
+            if ! ufw_output_allows_port "$status_text" "$ssh_port" tcp; then
                 die "Правило SSH ${ssh_port}/tcp не появилось в UFW. Включение firewall отменено, чтобы не потерять доступ."
             fi
         done
@@ -1561,6 +1605,14 @@ restart_one() {
 restart_services() {
     echo -e "\n${C_YELLOW}--- Шаг 5: Запуск служб ---${C_RESET}"
     if [[ "$INSTALL_UNBOUND" == true ]]; then
+        if ! ensure_unbound_root_key; then
+            log_warn "Нет /var/lib/unbound/root.key. Unbound не запускаю, Squid останется на системном DNS."
+            sed -i '/^dns_nameservers /d' "$SQUID_CONF"
+            INSTALL_UNBOUND=false
+        fi
+    fi
+    if [[ "$INSTALL_UNBOUND" == true ]]; then
+        systemctl reset-failed unbound >/dev/null 2>&1 || true
         if restart_one unbound 0; then
             log_ok "Unbound слушает 127.0.0.1:53."
         else
@@ -1851,6 +1903,25 @@ selftest() {
     fi
 
     [[ "$(normalize_port 03128)" == "3128" ]] || { echo "normalize_port failed"; rc=1; }
+    inactive=$'Status: inactive\n'
+    added=$'Added user rules:\nufw allow 22/tcp comment SSH\n'
+    rules='-A ufw-user-input -p tcp --dport 22 -j ACCEPT'
+    if ufw_output_allows_port "$inactive" 22 tcp; then
+        echo "inactive ufw status must not count as an SSH rule"
+        rc=1
+    fi
+    if ! ufw_output_allows_port "$added" 22 tcp; then
+        echo "ufw show added should allow 22/tcp"
+        rc=1
+    fi
+    if ! ufw_output_allows_port "$rules" 22 tcp; then
+        echo "ufw user.rules should allow 22/tcp"
+        rc=1
+    fi
+    if ufw_output_allows_port "$added" 2222 tcp; then
+        echo "port 2222 must not match a 22 rule"
+        rc=1
+    fi
     [[ "$(dante_candidate_action debian 12 1.4.2+dfsg-7)" == "refuse" ]] || { echo "debian 12 must refuse dante 1.4.2"; rc=1; }
     [[ "$(dante_candidate_action debian 11 1.4.2+dfsg-7+b2)" == "refuse" ]] || { echo "debian 11 must refuse dante 1.4.2"; rc=1; }
     [[ "$(dante_candidate_action debian 13 1.4.2+dfsg-7)" == "replace" ]] || { echo "debian 13 must replace dante 1.4.2"; rc=1; }
