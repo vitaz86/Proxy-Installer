@@ -40,6 +40,8 @@ SQUID_PASSWD="/etc/squid/passwd"
 SQUID_CONF="/etc/squid/squid.conf"
 DANTE_CONF="/etc/danted.conf"
 DANTE_LOG="/var/log/danted.log"
+INSTALL_LOG="/var/log/proxy-installer.log"
+INSTALL_LOG_READY=0
 DANTE_APT_LIST="/etc/apt/sources.list.d/proxy-installer-dante.list"
 DANTE_APT_PIN="/etc/apt/preferences.d/proxy-installer-dante"
 
@@ -71,10 +73,36 @@ USERS_TO_DELETE=()
 # Helpers
 # ====================================================================
 
-log_ok()   { echo -e "${C_GREEN}[+]${C_RESET} $*"; }
-log_info() { echo -e "${C_BLUE}[*]${C_RESET} $*"; }
-log_warn() { echo -e "${C_YELLOW}[!]${C_RESET} $*"; }
-log_err()  { echo -e "${C_RED}[x]${C_RESET} $*" >&2; }
+log_write() {
+    local level="$1"
+    shift
+    [[ "$INSTALL_LOG_READY" == "1" ]] || return 0
+    [[ -n "$INSTALL_LOG" ]] || return 0
+    printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$level" "$*" >> "$INSTALL_LOG" || return 0
+    if [[ "${EUID}" -eq 0 ]]; then
+        chown root:root "$INSTALL_LOG" 2>/dev/null || true
+        chmod 600 "$INSTALL_LOG" 2>/dev/null || true
+    fi
+}
+
+log_ok()   { log_write OK "$*";   echo -e "${C_GREEN}[+]${C_RESET} $*"; }
+log_info() { log_write INFO "$*"; echo -e "${C_BLUE}[*]${C_RESET} $*"; }
+log_warn() { log_write WARN "$*"; echo -e "${C_YELLOW}[!]${C_RESET} $*"; }
+log_err()  { log_write ERROR "$*"; echo -e "${C_RED}[x]${C_RESET} $*" >&2; }
+
+init_install_log() {
+    local previous_umask
+    previous_umask="$(umask)"
+    umask 077
+    touch "$INSTALL_LOG"
+    umask "$previous_umask"
+    if [[ "${EUID}" -eq 0 ]]; then
+        chown root:root "$INSTALL_LOG" 2>/dev/null || true
+        chmod 600 "$INSTALL_LOG"
+    fi
+    INSTALL_LOG_READY=1
+    log_write SESSION "======== новая установка: запуск ${SCRIPT_VERSION}, pid $$ ========"
+}
 
 die() {
     log_err "$*"
@@ -1553,6 +1581,7 @@ create_or_update_users() {
             useradd --system --no-create-home --shell "$NOLOGIN_SHELL" --comment "proxy-installer" "$user" \
                 || die "Не удалось создать пользователя '$user'."
             remember_user "$user"
+            log_ok "Создан пользователь прокси '$user'."
         fi
 
         chage -m 0 -M 99999 -I -1 -E -1 "$user" >/dev/null 2>&1 || true
@@ -1567,6 +1596,7 @@ create_or_update_users() {
                 || die "Не удалось добавить '$user' в ${SQUID_PASSWD}."
         fi
         add_squid_case_alias "$user" || die "Не удалось добавить строчный алиас Squid для '$user'."
+        log_ok "Пароль пользователя прокси '$user' записан для Dante и Squid."
         password=""
     done
 
@@ -1817,6 +1847,7 @@ restart_proxy_services() {
 }
 
 run_full_install() {
+    log_info "Начата полная установка или переустановка."
     if installer_present; then
         echo
         echo "Уже есть установка Squid, Dante или файлы этого скрипта."
@@ -2075,7 +2106,8 @@ print_summary() {
         echo -e "  ${C_YELLOW}Unbound DNS:${C_RESET}         127.0.0.1:53 (только для Squid)"
     fi
     echo
-    echo "Логи: /var/log/squid/access.log , ${DANTE_LOG} , /var/log/fail2ban.log"
+    echo "Логи прокси: /var/log/squid/access.log , ${DANTE_LOG} , /var/log/fail2ban.log"
+    echo "Журнал установщика (только root): ${INSTALL_LOG}"
     echo "Состояние установщика: ${STATE_FILE}"
     echo
     echo "Проверка Squid:  curl -x http://USER:PASS@${SERVER_IP}:${SQUID_PORT} https://example.com"
@@ -2135,6 +2167,22 @@ http_port 3128
 internal: 0.0.0.0 port = 1080
 EOF
     [[ "$(normalize_port 03128)" == "3128" ]] || { echo "normalize_port failed"; rc=1; }
+    local log_sample previous_ready previous_path
+    log_sample="$(mktemp)"
+    previous_ready="$INSTALL_LOG_READY"
+    previous_path="$INSTALL_LOG"
+    INSTALL_LOG="$log_sample"
+    INSTALL_LOG_READY=1
+    log_write SESSION "======== новая установка: запуск test ========"
+    log_write OK "Пользователь прокси 'alice' записан"
+    log_write ERROR "пример ошибки"
+    log_write SESSION "======== новая установка: запуск test-2 ========"
+    [[ "$(grep -c 'новая установка' "$log_sample")" -eq 2 ]] || { echo "install log must append sessions"; rc=1; }
+    grep -q "\[OK\] Пользователь прокси 'alice' записан" "$log_sample" || { echo "install log missed user"; rc=1; }
+    grep -q "\[ERROR\] пример ошибки" "$log_sample" || { echo "install log missed error"; rc=1; }
+    INSTALL_LOG_READY="$previous_ready"
+    INSTALL_LOG="$previous_path"
+    rm -f "$log_sample"
     [[ "$(squid_port_from_conf "$port_sample")" == "3128" ]] || { echo "squid port parse failed"; rc=1; }
     [[ "$(dante_port_from_conf "$port_sample")" == "1080" ]] || { echo "dante port parse failed"; rc=1; }
     rm -f "$port_sample"
@@ -2294,6 +2342,7 @@ main() {
     print_banner
 
     is_root || die "Запустите скрипт с правами root (sudo)."
+    init_install_log
     is_tty || die "Нужен интерактивный терминал. Скачайте скрипт и запустите: sudo ./proxy-installer.sh"
 
     detect_os

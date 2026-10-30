@@ -69,7 +69,7 @@ After completion, the script prints connection details. Run it again for the mai
 
 ## Troubleshooting
 - If the script fails with network errors, confirm outbound HTTPS (ICMP ping is not required).
-- Check logs: `/var/log/squid/access.log`, `/var/log/danted.log`, `/var/log/fail2ban.log`
+- Check logs: `/var/log/squid/access.log`, `/var/log/danted.log`, `/var/log/fail2ban.log`. Installer log, readable only by root: `/var/log/proxy-installer.log`
 - Service status: `sudo systemctl status squid danted fail2ban unbound`
 - Firewall: `sudo ufw status` (rules backup: `/etc/ufw/ufw.rules.backup`) or `sudo firewall-cmd --list-ports`
 - Squid config test: `sudo squid -k parse`
