@@ -65,11 +65,11 @@ Follow the prompts to:
 - Optionally install Unbound and apply network optimizations
 - Optionally enable UFW (SSH is allowed before UFW is turned on)
 
-After completion, the script prints connection details. Running it again detects an existing install and offers a full cleanup or a config-only rewrite.
+After completion, the script prints connection details. Run it again for the main menu: reinstall everything, or install, reconfigure, and remove Unbound, UFW, and Fail2ban separately.
 
 ## Troubleshooting
 - If the script fails with network errors, confirm outbound HTTPS (ICMP ping is not required).
-- Check logs: `/var/log/squid/access.log`, `/var/log/danted.log`, `/var/log/fail2ban.log`
+- Check logs: `/var/log/squid/access.log`, `/var/log/danted.log`, `/var/log/fail2ban.log`. Installer log, readable only by root: `/var/log/proxy-installer.log`
 - Service status: `sudo systemctl status squid danted fail2ban unbound`
 - Firewall: `sudo ufw status` (rules backup: `/etc/ufw/ufw.rules.backup`) or `sudo firewall-cmd --list-ports`
 - Squid config test: `sudo squid -k parse`
