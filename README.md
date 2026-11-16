@@ -16,7 +16,7 @@ An interactive Bash script for installing and configuring a forward HTTP/HTTPS p
 - Full cleanup or in-place reconfigure on rerun
 
 ## Requirements
-- Debian 13+ or Ubuntu 24.04+. Debian 12 and older, and Ubuntu 20.04 and 22.04, are refused: their Dante package is older than 1.4.4 (CVE-2024-54662) and the fixed build needs glibc 2.38. Ubuntu 24.04 and Debian 13 install Dante 1.4.4 from Debian testing.
+- Debian 13+ or Ubuntu 24.04+. On Ubuntu the installer enables the universe component when needed and uses Ubuntu's own `dante-server` 1.4.4. Debian's package is used only when the Ubuntu archive has no 1.4.4. Debian 12 and older, and Ubuntu 20.04 and 22.04, are refused: their Dante package is older than 1.4.4 (CVE-2024-54662) and the fixed build needs glibc 2.38.
 - Root privileges
 - An interactive terminal (do not pipe the script into bash)
 
