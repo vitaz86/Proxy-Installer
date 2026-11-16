@@ -715,6 +715,60 @@ package_available() {
     apt-cache show "$1" 2>/dev/null | grep -q '^Package:'
 }
 
+apt_candidate_version() {
+    local candidate=""
+    candidate="$(apt-cache policy "$1" 2>/dev/null | awk '/^[[:space:]]*Candidate:/ {print $2; exit}')"
+    if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$candidate"
+}
+
+is_ubuntu_family() {
+    case "$OS_ID" in
+        ubuntu|linuxmint|pop|elementary|zorin|neon|kubuntu|xubuntu|lubuntu) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+sources_file_add_universe() {
+    local file="$1" before after
+    [[ -f "$file" ]] || return 1
+    [[ "$file" == "$DANTE_APT_LIST" ]] && return 1
+    if [[ "$file" == *.sources ]]; then
+        grep -qE 'ubuntu\.com|ports\.ubuntu\.com' "$file" || return 1
+        grep -q '^Components:' "$file" || return 1
+        grep -qE '^Components:.*\<universe\>' "$file" && return 1
+        sed -i -E '/^Components:/ { /\<universe\>/! s/[[:space:]]*$/ universe/ }' "$file"
+        return 0
+    fi
+    if [[ "$file" == *.list ]]; then
+        grep -qE '^deb(-src)?[[:space:]].*(ubuntu\.com|ports\.ubuntu\.com)' "$file" || return 1
+        before="$(grep -cE '^deb(-src)?[[:space:]].*(ubuntu\.com|ports\.ubuntu\.com).*\<universe\>' "$file" || true)"
+        sed -i -E '/^deb(-src)?[[:space:]].*(ubuntu\.com|ports\.ubuntu\.com)/ { /\<universe\>/! s/[[:space:]]*$/ universe/ }' "$file"
+        after="$(grep -cE '^deb(-src)?[[:space:]].*(ubuntu\.com|ports\.ubuntu\.com).*\<universe\>' "$file" || true)"
+        [[ "${after:-0}" -gt "${before:-0}" ]]
+        return
+    fi
+    return 1
+}
+
+enable_ubuntu_universe() {
+    is_ubuntu_family || return 1
+    local file changed=0
+    shopt -s nullglob
+    for file in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+        if sources_file_add_universe "$file"; then
+            changed=1
+        fi
+    done
+    shopt -u nullglob
+    ((changed)) || return 1
+    log_info "Включён компонент universe, чтобы взять dante-server из репозитория Ubuntu."
+    apt-get update -qq -o Acquire::Retries=3 || log_warn "Не удалось обновить списки после включения universe."
+    return 0
+}
+
 dante_fallback_suite() {
     # Fixed release is 1.4.4 (CVE-2024-54662). Architectures without that
     # build are refused instead of receiving Debian 12's vulnerable 1.4.2.
@@ -802,8 +856,15 @@ debian_archive_keyring() {
 
 ensure_dante_repository() {
     local ver="" major="" action=""
-    if package_available dante-server; then
-        ver="$(apt-cache show dante-server | awk '/^Version:/ {print $2; exit}')"
+    ver="$(apt_candidate_version dante-server || true)"
+    if is_ubuntu_family && { [[ -z "$ver" ]] || ! dpkg --compare-versions "$ver" ge 1.4.4; }; then
+        if enable_ubuntu_universe; then
+            ver="$(apt_candidate_version dante-server || true)"
+            if [[ -n "$ver" ]] && dpkg --compare-versions "$ver" ge 1.4.4; then
+                log_ok "Ставлю dante-server ${ver} из репозитория Ubuntu (universe)."
+                return 0
+            fi
+        fi
     fi
     action="$(dante_candidate_action "$OS_ID" "$OS_VERSION_ID" "${ver:-0}" "$(glibc_version)")"
     case "$action" in
@@ -873,7 +934,7 @@ EOF
             die "Не удалось обновить списки после подключения Debian ${suite}."
         fi
     fi
-    ver="$(apt-cache show dante-server | awk '/^Version:/ {print $2; exit}')"
+    ver="$(apt_candidate_version dante-server || true)"
     if ! dpkg --compare-versions "$ver" ge 1.4.4; then
         rm -f "$DANTE_APT_LIST" "$DANTE_APT_PIN"
         die "В Debian ${suite} найден dante-server ${ver:-неизвестной версии}. Нужна версия 1.4.4 или новее (CVE-2024-54662)."
@@ -2248,6 +2309,33 @@ EOF
     [[ "$(dante_candidate_action ubuntu 22.04 1.4.3+dfsg-1)" == "refuse" ]] || { echo "ubuntu 22.04 must refuse dante 1.4.3"; rc=1; }
     [[ "$(dante_candidate_action ubuntu 24.04 1.4.3+dfsg-1)" == "replace" ]] || { echo "ubuntu 24.04 must replace dante 1.4.3"; rc=1; }
     [[ "$(dante_candidate_action ubuntu 24.04 1.4.3+dfsg-1 2.39)" == "replace" ]] || { echo "ubuntu 24.04 glibc 2.39 must replace"; rc=1; }
+    local universe_dir universe_file
+    universe_dir="$(mktemp -d)"
+    universe_file="${universe_dir}/ubuntu.sources"
+    cat > "$universe_file" <<'EOF'
+Types: deb
+URIs: http://archive.ubuntu.com/ubuntu
+Suites: resolute
+Components: main restricted
+EOF
+    sources_file_add_universe "$universe_file" || { echo "universe should be added"; rc=1; }
+    grep -q '^Components: main restricted universe$' "$universe_file" || { echo "universe component line wrong"; rc=1; }
+    if sources_file_add_universe "$universe_file"; then
+        echo "universe must not be added twice"
+        rc=1
+    fi
+    cat > "${universe_dir}/debian.sources" <<'EOF'
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: forky
+Components: main
+EOF
+    if sources_file_add_universe "${universe_dir}/debian.sources"; then
+        echo "debian source must stay unchanged"
+        rc=1
+    fi
+    grep -q '^Components: main$' "${universe_dir}/debian.sources" || { echo "debian components changed"; rc=1; }
+    rm -rf "$universe_dir"
     [[ "$(dante_candidate_action ubuntu 22.04 1.4.3+dfsg-1 2.35)" == "refuse" ]] || { echo "ubuntu 22.04 glibc 2.35 must refuse"; rc=1; }
     [[ "$(dante_candidate_action ubuntu 20.04 1.4.2+dfsg-7 2.31)" == "refuse" ]] || { echo "ubuntu 20.04 glibc 2.31 must refuse"; rc=1; }
     [[ "$(dante_candidate_action linuxmint 22 1.4.3+dfsg-1 2.39)" == "replace" ]] || { echo "mint 22 on noble glibc must replace"; rc=1; }
